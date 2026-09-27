@@ -201,7 +201,8 @@ the one most of the field picks. It cannot tell a literal pipe from one the writ
 ``\\|``, which a reader takes as a backslash followed by a live cell break, and each level of table nesting adds another
 backslash. The same cell context decides what becomes of a block the cell cannot hold: a nested table or list keeps its
 source HTML, legal there because raw HTML is inline content, rather than dropping its grid or its bullets onto the row
-as literal text.
+as literal text. A pipe table has no caption row either, so a ``<caption>`` renders as a paragraph above the grid, where
+a browser draws it by default wherever the source put it.
 
 A list's children are not always ``<li>`` elements: the parser keeps a ``<div>`` or bare text where the source put it,
 and page templates often wrap each item in its own element. Such content still renders, since a browser shows it. Text
