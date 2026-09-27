@@ -374,11 +374,21 @@ def test_breaks_quotes_rules(html: str, expected: str) -> None:
             id="table-caption-with-blocks",
         ),
         pytest.param("<table><caption>only</caption></table>", "only", id="table-caption-without-rows"),
+        pytest.param("<table><tr><td><p>A</p></td></tr></table>", "| A |\n| --- |", id="table-block-cell"),
+        pytest.param(
+            "<table><tr><td> <p>A</p> <p>B</p> </td></tr></table>",
+            "| A B |\n| --- |",
+            id="table-blocks-in-cell-join-with-one-space",
+        ),
+        pytest.param(
+            "<table><tr><td>a</td></tr><tr><td>b</td><td>c</td></tr></table>",
+            "| a |  |\n| --- | --- |\n| b | c |",
+            id="table-short-row-padded-with-empty-cells",
+        ),
     ],
 )
 def test_tables(html: str, expected: str) -> None:
-    # the trailing " |" of each row carries one space; compare line-rstripped
-    assert "\n".join(line.rstrip() for line in md(html).splitlines()) == expected
+    assert md(html) == expected
 
 
 @pytest.mark.parametrize(
@@ -608,7 +618,7 @@ def test_edge_cases(html: str, expected: str) -> None:
     ],
 )
 def test_table_edge_cases(html: str, expected: str) -> None:
-    assert "\n".join(line.rstrip() for line in md(html).splitlines()) == expected
+    assert md(html) == expected
 
 
 @pytest.mark.parametrize(
@@ -712,7 +722,7 @@ def test_kitchen_sink() -> None:
         "```c\nint main(void);\n```\n\n"
         "| K | V |\n| --- | --- |\n| a | 1 |"
     )
-    assert "\n".join(line.rstrip() for line in md(html).splitlines()) == expected
+    assert md(html) == expected
 
 
 _WORD = re.compile(r"[0-9a-z]+")
@@ -822,7 +832,7 @@ def test_markdown_many_words_wrap_at_requested_width(width: int) -> None:
         pytest.param("<p>aa bb cc</p><p>dd ee ff</p>", "aa bb\ncc\n\ndd ee\nff", id="paragraphs"),
         pytest.param(
             "<p>aa bb cc</p><table><tr><td>dd ee</td></tr></table><p>ff gg hh</p>",
-            "aa bb\ncc\n\n| dd ee | \n| --- | \n\nff gg\nhh",
+            "aa bb\ncc\n\n| dd ee |\n| --- |\n\nff gg\nhh",
             id="table-buffer",
         ),
     ],
@@ -979,8 +989,7 @@ def test_converter_on_inline_root_owes_no_leading_space() -> None:
 def test_converter_output_in_a_table_cell_escapes_its_pipes() -> None:
     html = "<table><tr><td><span>x</span></td></tr></table>"
     out = parse(html).to_markdown(Markdown(converters={"span": lambda _e, text: f"{text}|y"}))
-    # the trailing " |" of each row carries one space; compare line-rstripped
-    assert "\n".join(line.rstrip() for line in out.splitlines()) == "| x\\|y |\n| --- |"
+    assert out == "| x\\|y |\n| --- |"
 
 
 def test_reference_link_inside_converter_registers() -> None:
@@ -2050,13 +2059,13 @@ def test_images(html: str, opts: Markdown, expected: str) -> None:
         pytest.param(
             "<table><tr><td><pre>a|b</pre></td></tr></table>",
             Markdown(),
-            "|  ``` a\\|b ``` |\n| --- |",
+            "| ``` a\\|b ``` |\n| --- |",
             id="cell-pipe-escaped-in-preformatted-text",
         ),
     ],
 )
 def test_markdown_table_options(html: str, opts: Markdown, expected: str) -> None:
-    assert "\n".join(line.rstrip() for line in _configured_markdown(html, opts).splitlines()) == expected
+    assert _configured_markdown(html, opts) == expected
 
 
 @pytest.mark.parametrize(
@@ -2150,7 +2159,7 @@ def test_text_options(html: str, opts: Markdown, expected: str) -> None:
     ],
 )
 def test_option_edge_cases(html: str, opts: Markdown, expected: str) -> None:
-    assert "\n".join(line.rstrip() for line in _configured_markdown(html, opts).splitlines()) == expected
+    assert _configured_markdown(html, opts) == expected
 
 
 # A bad value is not caught when the config is built (the typed fields are not enforced
@@ -2298,4 +2307,4 @@ def test_reference_links_grow_past_initial_capacity() -> None:
 )
 def test_table_cells_with_th_and_comment(opts: Markdown, expected: str) -> None:
     html = "<table><tr><!--c--><template></template><th>H</th><td>x</td></tr><tr><td>a</td><td>b</td></tr></table>"
-    assert "\n".join(line.rstrip() for line in _configured_markdown(html, opts).splitlines()) == expected
+    assert _configured_markdown(html, opts) == expected
