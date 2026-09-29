@@ -1,17 +1,22 @@
 from __future__ import annotations
 
+import gc
 import re
 import sys
-from typing import TYPE_CHECKING, Final
+import threading
+from typing import TYPE_CHECKING, Final, cast
 
 import pytest
 from typing_extensions import assert_type
 
-from turbohtml import Document, Element, parse
-from turbohtml.query import Query
+import turbohtml
+from turbohtml import Document, Element, XPath, XPathString, parse, parse_xml
+from turbohtml.query import Query, select
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Iterable, Iterator
+    from types import SimpleNamespace
+
 
 _DOC = '<section><p class="lead">a</p><span>s</span><p class="tail">b</p><div><p>nested</p></div></section>'
 
@@ -703,3 +708,576 @@ def test_selector_eviction_refreshes_owner_returned_to_original_tree() -> None:
     for index in range(15):
         owner.select(f"unused{index}")
     assert [node.tag for node in owner.select("[fresh]")] == ["b"]
+
+
+@pytest.mark.parametrize("count", [pytest.param(0, id="empty"), pytest.param(1, id="one"), pytest.param(33, id="many")])
+@pytest.mark.parametrize(
+    "limit", [pytest.param(0, id="all"), pytest.param(1, id="first"), pytest.param(40, id="above")]
+)
+@pytest.mark.parametrize("warm", [pytest.param(False, id="cold"), pytest.param(True, id="warm")])
+def test_select_indexed_order(count: int, limit: int, *, warm: bool) -> None:
+    document: Final = parse("".join(f"<section><input id='{index}'><span></span></section>" for index in range(count)))
+    if warm:
+        document.select("span")
+    assert [element.attrs["id"] for element in select("input", document, limit=limit)] == [
+        str(index) for index in range(count)
+    ][: limit or None]
+
+
+def test_select_indexed_mutation() -> None:
+    document: Final = parse("<main><input id='first'><input id='second'></main>")
+    first, second = document.select("input")
+    first.tag = "span"
+    second.extract()
+    main: Final = document.find("main")
+    assert main is not None
+    main.append(Element("input", attrs={"id": "third"}))
+    assert [element.attrs["id"] for element in document.select("input")] == ["third"]
+
+
+def test_select_indexed_subtree_scope() -> None:
+    document: Final = parse("<input id='outside'><main><input id='inside'></main>")
+    document.select("input")
+    main: Final = document.find("main")
+    assert main is not None
+    assert [element.attrs["id"] for element in main.select("input")] == ["inside"]
+
+
+def test_select_indexed_xml_case() -> None:
+    document: Final = parse_xml('<root><input id="lower"/><INPUT id="upper"/></root>')
+    assert [element.attrs["id"] for element in document.select("input")] == ["lower"]
+
+
+@pytest.mark.skipif(sys.implementation.name != "cpython", reason="CPython allocation-triggered collection")
+@pytest.mark.parametrize("offset", range(8), ids=lambda offset: f"allocation-{offset}")
+@pytest.mark.parametrize("count", [pytest.param(7, id="shrink"), pytest.param(67, id="grow")])
+def test_select_indexed_collection(offset: int, count: int) -> None:
+    thresholds: Final = gc.get_threshold()
+    restore_gc: Final = gc.enable if gc.isenabled() else gc.disable
+    gc.disable()
+    gc.collect()
+    document: Final = parse("<main>" + "<input id='old'>" * 33 + "</main>")
+    document.select("input")
+    main: Final = document.find("main")
+    assert main is not None
+    collect: Final = document.select
+    changed = False
+
+    def clear(phase: str, _info: dict[str, int]) -> None:
+        nonlocal changed
+        if phase == "start" and not changed:
+            changed = True
+            main.set_inner_html("<input id='new'>" * count)
+
+    # Empty lists exhaust CPython's freelist so result allocation can trigger collection.
+    reserve: Final[list[list[None]]] = [[] for _ in range(512)]
+    gc.callbacks.append(clear)
+    try:
+        gc.set_threshold(gc.get_count()[0] + offset, thresholds[1], thresholds[2])
+        gc.enable()
+        result: Final = collect("input")
+        gc.collect()
+    finally:
+        gc.disable()
+        gc.callbacks.remove(clear)
+        gc.set_threshold(*thresholds)
+        restore_gc()
+        reserve.clear()
+    assert (changed, tuple(element.attrs["id"] for element in result), main.inner_html) in {
+        (True, ("old",) * 33, '<input id="new">' * count),
+        (True, ("new",) * count, '<input id="new">' * count),
+    }
+
+
+@pytest.mark.parametrize(
+    "limit", [pytest.param(1, id="first"), pytest.param(2, id="exact"), pytest.param(9, id="above")]
+)
+def test_select_indexed_filtered_limit(limit: int) -> None:
+    document: Final = parse('<input id="skip"><input id="first" checked><input id="second" checked>')
+    document.select("input")
+    assert [element.attrs["id"] for element in select("input[checked]", document, limit=limit)] == ["first", "second"][
+        :limit
+    ]
+
+
+def test_one_compiled_expression_across_threads_each_correct() -> None:
+    selector = XPath("//td[@class=$cls]")
+    documents = [
+        turbohtml.parse(f"<table><tr><td class='num'>{index}</td><td>x</td></tr></table>") for index in range(8)
+    ]
+    results: dict[int, list[str]] = {}
+    lock = threading.Lock()
+    start = threading.Barrier(len(documents))
+
+    def worker(index: int) -> None:
+        start.wait()
+        result = selector(documents[index], cls="num")
+        assert isinstance(result, list)
+        cells = [cell.text for cell in result if isinstance(cell, Element)]
+        with lock:
+            results[index] = cells
+
+    threads = [threading.Thread(target=worker, args=(index,)) for index in range(len(documents))]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    assert results == {index: [str(index)] for index in range(len(documents))}
+
+
+def test_concurrent_evaluation_on_one_document_is_memory_safe() -> None:
+    document = turbohtml.parse("<body>" + "".join(f"<p>{index}</p>" for index in range(100)) + "</body>")
+    selector = XPath("//p")
+    start = threading.Barrier(4)
+    counts: list[int] = []
+    lock = threading.Lock()
+
+    def worker() -> None:
+        start.wait()
+        for _ in range(50):
+            result = selector(document)
+            assert isinstance(result, list)
+            found = len(result)
+            with lock:
+                counts.append(found)
+
+    threads = [threading.Thread(target=worker) for _ in range(4)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    assert counts == [100] * 200
+
+
+@pytest.mark.skipif(sys.implementation.name == "pypy", reason="PyPy's gc exposes no is_tracked")
+def test_object_is_gc_tracked() -> None:
+    selector = XPath("//a")
+    assert gc.is_tracked(selector)
+
+
+def test_collect_with_live_objects_traverses_them() -> None:
+    def extension(_context: SimpleNamespace) -> str:
+        return "x"
+
+    extensions: dict[tuple[str | None, str], Callable[..., str | float | bool]] = {(None, "x"): extension}
+    plain = XPath("//a")
+    with_extensions = XPath("x()", extensions=extensions)
+    gc.collect()
+    compiled_doc = turbohtml.parse("<a>one</a>")
+    assert plain(compiled_doc) == [compiled_doc.xpath_one("//a")]
+    assert with_extensions(compiled_doc) == "x"
+
+
+@pytest.mark.skipif(
+    sys.implementation.name == "pypy",
+    reason="cpyext never breaks a cycle that runs through both a C extension object and a Python one, "
+    "so this cycle leaks there; see docs/explanation/interpreters.rst",
+)
+def test_extension_reference_cycle_is_collected() -> None:
+    class Holder:
+        ref: XPath | None = None
+
+        def extension(self, _context: SimpleNamespace) -> str:
+            return repr(self.ref)
+
+    holder = Holder()
+    extensions: dict[tuple[str | None, str], Callable[..., str | float | bool]] = {(None, "x"): holder.extension}
+    selector = XPath("x()", extensions=extensions)
+    holder.ref = selector  # selector -> extensions -> bound method -> holder -> selector
+    assert selector(turbohtml.parse("<a>one</a>")) == "XPath('x()')"
+    del selector
+    del holder
+    del extensions
+    assert gc.collect() >= 0
+
+
+COMPILED_HTML: Final[str] = "<html><body><div><p>a</p><p>b</p></div><a href='/x'>x</a></body></html>"
+
+
+@pytest.fixture
+def compiled_doc() -> turbohtml.Node:
+    return turbohtml.parse(COMPILED_HTML)
+
+
+def tags(result: object) -> list[str]:
+    assert isinstance(result, list)
+    return [node.tag for node in result if isinstance(node, Element)]
+
+
+def test_repeated_query_is_consistent(compiled_doc: turbohtml.Node) -> None:
+    for _ in range(5):
+        assert tags(compiled_doc.xpath("//p")) == ["p", "p"]
+
+
+def test_move_to_front(compiled_doc: turbohtml.Node) -> None:
+    # //p falls behind //a in the cache, then is queried again from a non-front slot
+    compiled_doc.xpath("//p")
+    compiled_doc.xpath("//a")
+    assert tags(compiled_doc.xpath("//p")) == ["p", "p"]
+
+
+def test_distinct_but_equal_key_hits_same_entry(compiled_doc: turbohtml.Node) -> None:
+    name = "p"
+    first = f"//{name}"
+    second = f"//{name}"
+    assert first is not second  # two distinct str objects with equal content
+    compiled_doc.xpath(first)
+    assert tags(compiled_doc.xpath(second)) == ["p", "p"]
+
+
+def test_eviction_recompiles(compiled_doc: turbohtml.Node) -> None:
+    assert tags(compiled_doc.xpath("//p")) == ["p", "p"]
+    # fill past the cache capacity with distinct expressions, evicting //p
+    for index in range(20):
+        assert compiled_doc.xpath(f"//missing{index}") == []
+    # //p was evicted; it must recompile to the same answer
+    assert tags(compiled_doc.xpath("//p")) == ["p", "p"]
+
+
+def test_compile_error_after_caching(compiled_doc: turbohtml.Node) -> None:
+    compiled_doc.xpath("//p")  # populate the cache first
+    with pytest.raises(ValueError, match="node test"):
+        compiled_doc.xpath("//")
+
+
+SMART_HTML: Final[str] = "<html><body><a href='/x' class='c'>link</a></body></html>"
+
+
+@pytest.fixture
+def smart_doc() -> turbohtml.Node:
+    return turbohtml.parse(SMART_HTML)
+
+
+def first_xpath_result(result: object) -> object:
+    assert isinstance(result, list)
+    return result[0]
+
+
+def test_default_is_a_plain_string(smart_doc: turbohtml.Node) -> None:
+    result = first_xpath_result(smart_doc.xpath("//a/@href"))
+    assert type(result) is str
+    assert result == "/x"
+
+
+def test_smart_strings_false_is_a_plain_string(smart_doc: turbohtml.Node) -> None:
+    result = first_xpath_result(smart_doc.xpath("//a/@href", smart_strings=False))
+    assert type(result) is str
+
+
+def test_a_plain_variable_keyword_does_not_enable_smart_strings(smart_doc: turbohtml.Node) -> None:
+    # kwargs present but no smart_strings key: the result stays a plain str.
+    result = first_xpath_result(smart_doc.xpath("//a[@href=$h]/@href", h="/x"))
+    assert type(result) is str
+
+
+def test_smart_attribute_remembers_its_element(smart_doc: turbohtml.Node) -> None:
+    result = first_xpath_result(smart_doc.xpath("//a/@href", smart_strings=True))
+    assert isinstance(result, XPathString)
+    assert result == "/x"
+    assert result.is_attribute is True
+    assert result.is_text is False
+    assert result.is_tail is False
+    assert result.attrname == "href"
+    parent = result.getparent()
+    assert isinstance(parent, Element)
+    assert parent.tag == "a"
+
+
+def test_smart_text_remembers_its_element(smart_doc: turbohtml.Node) -> None:
+    result = first_xpath_result(smart_doc.xpath("//a/text()", smart_strings=True))
+    assert isinstance(result, XPathString)
+    assert result == "link"
+    assert result.is_text is True
+    assert result.is_attribute is False
+    assert result.attrname is None
+    assert result.getparent().tag == "a"
+
+
+def test_smart_strings_alongside_a_variable(smart_doc: turbohtml.Node) -> None:
+    # smart_strings is consumed as an option; h is still bound as a $variable.
+    result = first_xpath_result(smart_doc.xpath("//a[@href=$h]/@href", h="/x", smart_strings=True))
+    assert isinstance(result, XPathString)
+    assert result.getparent().tag == "a"
+
+
+def test_smart_strings_through_xpath_one(smart_doc: turbohtml.Node) -> None:
+    result = smart_doc.xpath_one("//a/@class", smart_strings=True)
+    assert isinstance(result, XPathString)
+    assert result.attrname == "class"
+
+
+def test_smart_strings_through_xpath_iter(smart_doc: turbohtml.Node) -> None:
+    results = list(smart_doc.xpath_iter("//a/@href", smart_strings=True))
+    assert all(isinstance(result, XPathString) for result in results)
+
+
+EXTENSIONS_HTML: Final[str] = "<html><body><a href='/x'>one</a><a href='/y'>two</a></body></html>"
+
+
+def count_nodes(_context: SimpleNamespace, nodes: list[object]) -> float:
+    return float(len(nodes))
+
+
+def shout(_context: SimpleNamespace, text: str) -> str:
+    return text.upper()
+
+
+def echo(_context: SimpleNamespace, value: float | bool) -> float | bool:  # ruff:ignore[boolean-type-hint-positional-argument]  # positional by convention
+    return value
+
+
+def context_tag(context: SimpleNamespace) -> str:
+    return context.context_node.tag
+
+
+EXTENSIONS: dict[tuple[str | None, str], Callable[..., str | float | bool | Element | Iterable[Element]]] = {
+    (None, "count_nodes"): count_nodes,
+    (None, "shout"): shout,
+    (None, "echo"): echo,
+    (None, "context_tag"): context_tag,
+}
+
+
+@pytest.fixture
+def extension_doc() -> turbohtml.Node:
+    return turbohtml.parse(EXTENSIONS_HTML)
+
+
+def test_nodeset_argument_arrives_as_a_list(extension_doc: turbohtml.Node) -> None:
+    assert extension_doc.xpath("count_nodes(//a)", extensions=EXTENSIONS) == pytest.approx(2.0)
+
+
+def test_string_argument_and_string_return(extension_doc: turbohtml.Node) -> None:
+    assert extension_doc.xpath("shout(string(//a[1]/@href))", extensions=EXTENSIONS) == "/X"
+
+
+def test_number_argument_round_trips(extension_doc: turbohtml.Node) -> None:
+    assert extension_doc.xpath("echo(40 + 2)", extensions=EXTENSIONS) == pytest.approx(42.0)
+
+
+def test_boolean_argument_round_trips(extension_doc: turbohtml.Node) -> None:
+    assert extension_doc.xpath("echo(true())", extensions=EXTENSIONS) is True
+
+
+def test_context_node_is_the_current_element(extension_doc: turbohtml.Node) -> None:
+    result = extension_doc.xpath("//a[context_tag()='a']", extensions=EXTENSIONS)
+    assert isinstance(result, list)
+    nodes = [n for n in result if isinstance(n, Element)]
+    assert [n.text for n in nodes] == ["one", "two"]
+
+
+def test_extension_in_a_predicate(extension_doc: turbohtml.Node) -> None:
+    result = extension_doc.xpath("//a[count_nodes(.) = 1]", extensions=EXTENSIONS)
+    assert isinstance(result, list)
+    nodes = [n for n in result if isinstance(n, Element)]
+    assert [n.text for n in nodes] == ["one", "two"]
+
+
+def test_extension_alongside_a_variable(extension_doc: turbohtml.Node) -> None:
+    assert extension_doc.xpath("shout($s)", s="hi", extensions=EXTENSIONS) == "HI"
+
+
+def test_extension_through_xpath_one(extension_doc: turbohtml.Node) -> None:
+    assert extension_doc.xpath_one("count_nodes(//a)", extensions=EXTENSIONS) == pytest.approx(2.0)
+
+
+def test_unknown_function_with_extensions_raises(extension_doc: turbohtml.Node) -> None:
+    with pytest.raises(ValueError, match="unknown function 'nope'"):
+        extension_doc.xpath("nope()", extensions=EXTENSIONS)
+
+
+def test_unknown_function_without_extensions_raises(extension_doc: turbohtml.Node) -> None:
+    with pytest.raises(ValueError, match="unknown function 'count_nodes'"):
+        extension_doc.xpath("count_nodes(//a)")
+
+
+def test_empty_extensions_dict_registers_nothing(extension_doc: turbohtml.Node) -> None:
+    with pytest.raises(ValueError, match="unknown function 'count_nodes'"):
+        extension_doc.xpath("count_nodes(//a)", extensions={})
+
+
+def test_none_extensions_is_the_same_as_omitting_it(extension_doc: turbohtml.Node) -> None:
+    assert isinstance(extension_doc.xpath("//a", extensions=None), list)
+
+
+def test_extension_that_raises_propagates(extension_doc: turbohtml.Node) -> None:
+    with pytest.raises(ZeroDivisionError):
+        extension_doc.xpath("boom()", extensions={(None, "boom"): lambda _context: 1 / 0})
+
+
+def test_extension_returning_a_non_scalar_is_a_type_error(extension_doc: turbohtml.Node) -> None:
+    with pytest.raises(TypeError, match="extension result must be"):
+        extension_doc.xpath("bad()", extensions={(None, "bad"): lambda _context: [1, 2]})  # ty: ignore[invalid-argument-type]  # non-scalar return on purpose
+
+
+def test_extensions_must_be_a_dict(extension_doc: turbohtml.Node) -> None:
+    with pytest.raises(TypeError, match="extensions must be a dict"):
+        extension_doc.xpath("//a", extensions="not a dict")  # ty: ignore[invalid-argument-type]  # wrong type on purpose
+
+
+def test_extension_receiving_an_element_from_a_nodeset(extension_doc: turbohtml.Node) -> None:
+    # the marshaled node-set holds Element objects the extension can navigate.
+    def first_text(_context: SimpleNamespace, nodes: list[Element]) -> str:
+        return nodes[0].text
+
+    assert extension_doc.xpath("first_text(//a)", extensions={(None, "first_text"): first_text}) == "one"
+
+
+def first_node(_context: SimpleNamespace, nodes: list[Element]) -> Element:
+    return nodes[0]
+
+
+def first_two(_context: SimpleNamespace, nodes: list[Element]) -> list[Element]:
+    return nodes[:2]
+
+
+def each(_context: SimpleNamespace, nodes: list[Element]) -> Iterator[Element]:
+    yield from nodes
+
+
+def all_nodes(_context: SimpleNamespace, nodes: list[Element]) -> list[Element]:
+    return nodes
+
+
+def empty(_context: SimpleNamespace, _nodes: list[Element]) -> list[Element]:
+    return []
+
+
+NODESET_EXTENSIONS: dict[tuple[str | None, str], Callable[..., str | float | bool | Element | Iterable[Element]]] = {
+    (None, "first_node"): first_node,
+    (None, "first_two"): first_two,
+    (None, "each"): each,
+    (None, "all_nodes"): all_nodes,
+    (None, "empty"): empty,
+}
+
+
+@pytest.fixture
+def big_doc() -> turbohtml.Node:
+    return turbohtml.parse("<ul>" + "".join(f"<li>{index}</li>" for index in range(12)) + "</ul>")
+
+
+def _texts(result: object) -> list[str]:
+    assert isinstance(result, list)
+    return [node.text if isinstance(node, Element) else str(node) for node in result]
+
+
+@pytest.mark.parametrize(
+    ("fixture", "expression", "expected"),
+    [
+        pytest.param("doc", "first_node(//a)", ["one"], id="single-element-is-a-node-set"),
+        pytest.param("doc", "first_two(//a)", ["one", "two"], id="list-of-elements-is-a-node-set"),
+        pytest.param("doc", "each(//a)", ["one", "two"], id="generator-of-elements-is-a-node-set"),
+        pytest.param("doc", "empty(//a)", [], id="empty-iterable-is-an-empty-node-set"),
+        pytest.param("doc", "first_node(//a)/text()", ["one"], id="node-set-feeds-a-later-path-step"),
+        pytest.param("doc", "first_two(//a)[2]", ["two"], id="node-set-feeds-a-predicate"),
+        pytest.param(
+            "big_doc", "all_nodes(//li)", [str(index) for index in range(12)], id="many-elements-grow-the-node-set"
+        ),
+    ],
+)
+def test_extension_result_becomes_a_node_set(
+    extension_doc: turbohtml.Node, big_doc: turbohtml.Node, *, fixture: str, expression: str, expected: list[str]
+) -> None:
+    page: Final = big_doc if fixture == "big_doc" else extension_doc
+    assert _texts(page.xpath(expression, extensions=NODESET_EXTENSIONS)) == expected
+
+
+def test_extension_returning_an_integer_stays_a_number(extension_doc: turbohtml.Node) -> None:
+    assert extension_doc.xpath("five()", extensions={(None, "five"): lambda _context: 5}) == pytest.approx(5.0)
+
+
+def return_none(_context: SimpleNamespace) -> Element:
+    return cast("Element", None)
+
+
+def mixed(_context: SimpleNamespace, nodes: list[Element]) -> list[Element]:
+    return [nodes[0], cast("Element", 123)]
+
+
+def raise_partway(_context: SimpleNamespace, nodes: list[Element]) -> Iterator[Element]:
+    yield nodes[0]
+    msg = "boom"
+    raise RuntimeError(msg)
+
+
+_OTHER_DOCUMENT = turbohtml.parse("<p>elsewhere</p>")
+_STRANGER = next(node for node in _OTHER_DOCUMENT.xpath_iter("//p") if isinstance(node, Element))
+
+
+def steal(_context: SimpleNamespace) -> Element:
+    return _STRANGER
+
+
+@pytest.mark.parametrize(
+    ("function", "expression", "exception", "match"),
+    [
+        pytest.param(
+            return_none, "return_none()", TypeError, "extension result must be", id="none-result-is-a-type-error"
+        ),
+        pytest.param(
+            mixed, "mixed(//a)", TypeError, "extension result must be", id="non-element-in-iterable-is-a-type-error"
+        ),
+        pytest.param(
+            steal, "steal()", ValueError, "different document", id="foreign-document-element-is-a-value-error"
+        ),
+        pytest.param(
+            raise_partway, "raise_partway(//a)", RuntimeError, "boom", id="iterable-that-raises-partway-propagates"
+        ),
+    ],
+)
+def test_extension_result_marshaling_is_rejected(
+    extension_doc: turbohtml.Node,
+    *,
+    function: Callable[..., str | float | bool | Element | Iterable[Element]],
+    expression: str,
+    exception: type[Exception],
+    match: str,
+) -> None:
+    name = expression[: expression.index("(")]
+    with pytest.raises(exception, match=match):
+        extension_doc.xpath(expression, extensions={(None, name): function})
+
+
+@pytest.mark.parametrize("count", [31, 32, 33], ids=["small", "threshold", "large"])
+@pytest.mark.parametrize(
+    ("stride", "gap", "padding"),
+    [
+        pytest.param(1, "", 0, id="complete"),
+        pytest.param(1, "", 1, id="one-omitted"),
+        pytest.param(1, "text<!--gap-->", 2, id="dense"),
+        pytest.param(19, "text<!--gap-->", 2, id="sparse"),
+    ],
+)
+@pytest.mark.parametrize("order", ["sorted", "reversed", "shuffled"])
+def test_find_sibling_root_order(count: int, stride: int, gap: str, padding: int, order: str) -> None:
+    document: Final = parse(
+        "<main>" + "".join(f"<div><i>{index}</i></div>{gap}" for index in range(count * stride + padding)) + "</main>"
+    )
+    start: Final = padding // 2
+    roots = document.select("div")[start : start + count * stride : stride]
+    if order == "reversed":
+        roots.reverse()
+    elif order == "shuffled":
+        roots = roots[::2] + roots[1::2]
+    assert [node.text for node in Query([*roots, *roots]).find("i")] == [
+        str(start + index * stride) for index in range(count)
+    ]
+
+
+@pytest.mark.parametrize("order", ["sorted", "reversed", "shuffled"])
+def test_find_mixed_parent_root_order(order: str) -> None:
+    document: Final = parse(
+        "<main>" + "".join(f"<section><div><i>{index}</i></div></section>" for index in range(40)) + "</main>"
+    )
+    roots = document.select("div")
+    if order == "reversed":
+        roots.reverse()
+    elif order == "shuffled":
+        roots = roots[::2] + roots[1::2]
+    assert [node.text for node in Query(roots).find("i")] == [str(index) for index in range(40)]
+
+
+def test_find_nested_root_order() -> None:
+    document: Final = parse("<main>" + "<div><i>x</i>" * 40 + "</div>" * 40 + "</main>")
+    assert list(Query(reversed(document.select("div"))).find("i")) == document.select("i")

@@ -25,6 +25,7 @@ from turbohtml import (
     parse_fragment,
     parse_xml,
 )
+from turbohtml.query import Query
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterable
@@ -281,6 +282,45 @@ def test_identity_survives_alias_release_and_adoption(released: int) -> None:
     destination: Final = Element("aside")
     destination.append(aliases[0])
     assert (len({*aliases, destination.children[0]}), hash(aliases[1])) == (1, original_hash)
+
+
+@pytest.mark.parametrize(
+    "count", [pytest.param(1, id="one"), pytest.param(12, id="inline"), pytest.param(32, id="expanded")]
+)
+@pytest.mark.parametrize("keep", [pytest.param(False, id="released"), pytest.param(True, id="retained")])
+def test_adoption_preserves_descendants_after_alias_release(count: int, *, keep: bool) -> None:
+    source: Final = Element("section")
+    source.set_inner_html("<span>text</span>" * count)
+    aliases: Final = source.select("span")
+    retained: Final = aliases[-1:] if keep else []
+    aliases.clear()
+    target: Final = Element("main")
+    target.append(source)
+    if retained:
+        retained[0].attrs["live"] = "yes"
+    assert target.inner_html == "<section>" + "<span>text</span>" * (count - 1) + (
+        '<span live="yes">text</span></section>' if keep else "<span>text</span></section>"
+    )
+
+
+@pytest.mark.parametrize("operation", ["find", "indexed", "css", "xpath", "parent"])
+def test_element_result_types_after_adoption(operation: str) -> None:
+    source: Final = parse('<section><a data-x="yes"><b></b></a><a data-x="yes"><b></b></a></section>')
+    section: Final = source.select("section")[0]
+    expected: Final = section.select("a")
+    target: Final = parse("<main></main>")
+    target.select("main")[0].append(section)
+    if operation == "find":
+        result = target.find_all(attrs={"data-x": True})
+    elif operation == "indexed":
+        result = target.find_all("a")
+    elif operation == "css":
+        result = target.select("a")
+    elif operation == "xpath":
+        result = cast("list[Element]", target.xpath("//a"))
+    else:
+        result = list(Query(target.select("b")).parent())
+    assert [(type(node), node) for node in result] == [(Element, node) for node in expected]
 
 
 def test_hash_survives_release_of_all_adopted_aliases() -> None:
@@ -1083,3 +1123,63 @@ def test_competitor_node_equality_duplicates_unsupported() -> None:
     operation: Final = cast("Callable[[tuple[int, str]], bool]", beautifulsoup.OPERATIONS["node-equals"][0])
     with pytest.raises(ValueError, match="constructor does not normalize case variants"):
         operation(cast("tuple[int, str]", INPUTS["node-equals"]()[12][1]))
+
+
+@pytest.mark.parametrize(
+    ("html", "selector", "expected"),
+    [
+        pytest.param("<body><p>a<b>b</b><i>c</i></p>d</body>", "body", "abcd", id="nested-elements"),
+        pytest.param("<p>a&amp;b\U0001f600c</p>", "p", "a&b\U0001f600c", id="entities-and-astral-span"),
+        pytest.param("<body></body>", "body", "", id="empty"),
+    ],
+)
+def test_text_concatenates_descendant_character_data(
+    find: Callable[[str, str], Element], html: str, selector: str, expected: str
+) -> None:
+    assert find(html, selector).text == expected
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        pytest.param("", id="empty"),
+        pytest.param("ascii", id="ascii"),
+        pytest.param("café", id="latin1"),
+        pytest.param("雪", id="bmp"),
+        pytest.param("😀", id="supplementary"),
+        pytest.param("\U00100000\U000f0000", id="or-exceeds-unicode-range"),
+        pytest.param("\ufeff\ufffe", id="bom-and-noncharacter"),
+        pytest.param("\ud800", id="lone-surrogate"),
+        pytest.param("\ud800\udc00", id="surrogate-pair"),
+        pytest.param("a\x00b", id="embedded-nul"),
+    ],
+)
+@pytest.mark.parametrize("wrapped", [False, True], ids=["text-root", "element-root"])
+def test_text_preserves_unicode(text: str, *, wrapped: bool) -> None:
+    child: Final = Text(text)
+    root: Final = Element("p", children=[child]) if wrapped else child
+    assert root.text == text
+
+
+@pytest.mark.parametrize(
+    ("node", "expected"),
+    [
+        pytest.param(CData("ignored"), "", id="cdata-root"),
+        pytest.param(Element("p", children=[CData("ignored"), Text("visible")]), "visible", id="cdata-child"),
+    ],
+)
+def test_text_ignores_cdata(node: Node, expected: str) -> None:
+    assert node.text == expected
+
+
+def test_text_subnode_excludes_siblings() -> None:
+    root: Final = Element("main", children=[Text("before"), Element("p", children=[Text("inside")]), Text("after")])
+    paragraph: Final = root.find("p")
+    assert paragraph is not None
+    assert paragraph.text == "inside"
+
+
+def test_text_ascii_flag_ignores_non_text_data() -> None:
+    root: Final = Element("p", children=[Comment("😀"), CData("雪"), Text("ascii")])
+    result: Final = root.text
+    assert (result, result.isascii()) == ("ascii", True)

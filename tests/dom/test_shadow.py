@@ -1,13 +1,28 @@
 from __future__ import annotations
 
+import gc
+import sys
+from concurrent.futures import ThreadPoolExecutor
+from threading import Barrier
 from typing import TYPE_CHECKING, Final
 
 import pytest
 
-from turbohtml import Comment, Element, Range, ShadowRoot, Text, parse, parse_fragment
+from turbohtml import (
+    Comment,
+    Document,
+    DocumentFragment,
+    Element,
+    Range,
+    ShadowRoot,
+    Text,
+    parse,
+    parse_fragment,
+    parse_xml,
+)
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable
+    from collections.abc import Callable, Iterable
 
     from turbohtml import Node
 
@@ -752,3 +767,341 @@ def test_unassigned_slot_keeps_fallback(content: str) -> None:
     root.set_inner_html('<slot name="other"></slot>' * 64 + '<slot name="target"><b>fallback</b></slot>')
     slot: Final[Element] = root.select('slot[name="target"]')[0]
     assert (slot.assigned_nodes(), slot.assigned_nodes(flatten=True)) == ([], slot.select("b"))
+
+
+@pytest.mark.parametrize("mode", ["open", "closed"])
+@pytest.mark.parametrize("depth", [1, 80])
+def test_shadow_adoption_preserves_aliases(mode: str, depth: int) -> None:
+    host: Final = Element("div", children=[Element("span"), Text("light")])
+    children: Final = host.children
+    roots: Final[list[tuple[Element, ShadowRoot, Element, int]]] = []
+    current = host
+    for _ in range(depth):
+        root = current.attach_shadow(mode=mode)
+        root.set_inner_html("<section><slot></slot></section>")
+        child = root.find("section")
+        assert child is not None
+        roots.append((current, root, child, hash(root)))
+        current = child
+    target: Final = Element("main")
+    target.append(host)
+    assert host.children == children
+    for owner, root, child, saved_hash in roots:
+        assert (root.host, root.children, hash(root)) == (owner, (child,), saved_hash)
+        assert owner.shadow_root == (root if mode == "open" else None)
+
+
+@pytest.mark.parametrize("method", ["assigned_nodes", "assigned_elements", "flattened_children"])
+def test_shadow_results_during_adoption(method: str) -> None:
+    host: Final = Element("div")
+    for index in range(32):
+        host.append(Element("span", children=[Text(str(index))]))
+        host.append(Text(" "))
+    expected: Final = [node for node in host.children if method != "assigned_elements" or isinstance(node, Element)]
+    root: Final = host.attach_shadow()
+    root.set_inner_html("<slot></slot>")
+    slot: Final = root.find("slot")
+    assert slot is not None
+    targets: Final = (Element("main"), Element("section"))
+    start: Final = Barrier(2)
+    collect: Final = slot.assigned_elements if method == "assigned_elements" else slot.assigned_nodes
+
+    def read() -> None:
+        start.wait()
+        for _ in range(200):
+            assert (slot.flattened_children if method == "flattened_children" else collect()) == expected
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        reader: Final = pool.submit(read)
+        start.wait()
+        for index in range(200):
+            targets[index % 2].append(host)
+        reader.result()
+    assert host.parent == targets[1]
+
+
+@pytest.mark.parametrize("markup", ["", "<i>one</i><b>two</b>"])
+@pytest.mark.parametrize("xml", [False, True])
+def test_shadow_adoption_preserves_content(markup: str, *, xml: bool) -> None:
+    host: Final = Element("div")
+    root: Final = host.attach_shadow()
+    root.set_inner_html(markup)
+    children: Final = root.children
+    target: Final = parse_xml("<main/>").find("main") if xml else Element("main")
+    assert target is not None
+    target.append(host)
+    assert (root.inner_html, root.children, root.host) == (markup, children, host)
+
+
+@pytest.mark.parametrize("shadow", [False, True])
+def test_fragment_adopts_shadow_hosts(*, shadow: bool) -> None:
+    fragment: Final = Element("section").attach_shadow() if shadow else DocumentFragment()
+    host: Final = Element("div", children=[Element("span")])
+    fragment.append(host)
+    root: Final = host.attach_shadow()
+    root.set_inner_html("<slot></slot>")
+    slot: Final = root.find("slot")
+    assert slot is not None
+    child: Final = host.children[0]
+    target: Final = Element("main")
+    target.append(fragment)
+    assert (target.children, host.shadow_root, root.host, slot.assigned_nodes()) == ((host,), root, host, [child])
+
+
+def test_shadow_adoption_preserves_declarative_flags() -> None:
+    document: Final = parse(
+        "<div><template shadowrootmode=open shadowrootdelegatesfocus shadowrootclonable>x</template></div>"
+    )
+    host: Final = document.find("div")
+    assert host is not None
+    root: Final = host.shadow_root
+    assert root is not None
+    Element("main").append(host)
+    assert (root.mode, root.delegates_focus, root.clonable, root.text) == ("open", True, True, "x")
+
+
+@pytest.mark.skipif(sys.implementation.name != "cpython", reason="CPython allocation-triggered collection")
+@pytest.mark.parametrize("method", ["assigned_nodes", "assigned_elements", "flattened_children"])
+@pytest.mark.parametrize("offset", [-1, 0, 1])
+def test_shadow_results_survive_collection_adoption(method: str, offset: int) -> None:
+    thresholds: Final = gc.get_threshold()
+    restore_gc: Final = gc.enable if gc.isenabled() else gc.disable
+    gc.disable()
+    gc.collect()
+    document: Final = parse("<div>text<span>hello</span></div>")
+    host: Final = document.find("div")
+    assert host is not None
+    expected: Final = [child for child in host.children if method != "assigned_elements" or isinstance(child, Element)]
+    root: Final = host.attach_shadow()
+    root.set_inner_html("<slot></slot>")
+    slot: Final = root.find("slot")
+    assert slot is not None
+    target: Final = Element("main")
+    changed = False
+
+    def adopt(phase: str, _info: dict[str, int]) -> None:
+        nonlocal changed
+        if phase == "start" and not changed:
+            changed = True
+            target.append(host)
+
+    collect: Final = slot.assigned_elements if method == "assigned_elements" else slot.assigned_nodes
+    # Retained empty lists exhaust the freelist so result allocation can trigger collection.
+    reserve: Final[list[list[None]]] = [[] for _ in range(512)]
+    gc.callbacks.append(adopt)
+    try:
+        gc.set_threshold(gc.get_count()[0] + offset, thresholds[1], thresholds[2])
+        gc.enable()
+        result: Final = slot.flattened_children if method == "flattened_children" else collect()
+        gc.collect()
+    finally:
+        gc.disable()
+        gc.callbacks.remove(adopt)
+        gc.set_threshold(*thresholds)
+        restore_gc()
+        reserve.clear()
+    assert (changed, result, host.parent) == (True, expected, target)
+
+
+def _fragment(*tags: str) -> DocumentFragment:
+    fragment = DocumentFragment()
+    for tag in tags:
+        fragment.append(Element(tag))
+    return fragment
+
+
+def _host_page() -> tuple[Document, Element]:
+    document = parse("<div id=a><i></i></div>")
+    target = document.select_one("#a")
+    assert target is not None
+    return document, target
+
+
+def test_document_fragment_starts_empty() -> None:
+    assert (DocumentFragment().html, repr(DocumentFragment())) == ("", "DocumentFragment()")
+
+
+def test_document_fragment_takes_no_arguments() -> None:
+    with pytest.raises(TypeError):
+        DocumentFragment("x")  # ty: ignore[too-many-positional-arguments]
+
+
+def test_document_fragment_adoption_preserves_descendants() -> None:
+    fragment = _fragment("section", "aside")
+    section = fragment.children[0]
+    assert isinstance(section, Element)
+    section.append(Element("b"))
+    descendant = section.select_one("b")
+    assert descendant is not None
+    attributes = descendant.attrs
+    held = {descendant}
+    target = Element("main")
+    target.append(fragment)
+    attributes["title"] = "moved"
+    assert (target.select_one("b") in held, target.html, fragment.html) == (
+        True,
+        '<main><section><b title="moved"></b></section><aside></aside></main>',
+        "",
+    )
+
+
+def test_shadow_root_is_a_document_fragment() -> None:
+    root = Element("div").attach_shadow("open")
+    assert (isinstance(root, DocumentFragment), repr(root)) == (True, "ShadowRoot()")
+
+
+@pytest.mark.parametrize("extract", [pytest.param(False, id="clone"), pytest.param(True, id="extract")])
+def test_range_contents_are_a_document_fragment(*, extract: bool) -> None:
+    _, target = _host_page()
+    boundary = Range(target, 0)
+    boundary.set_end(target, 1)
+    contents = boundary.extract_contents() if extract else boundary.clone_contents()
+    assert (type(contents), contents.html) == (DocumentFragment, "<i></i>")
+
+
+_INSERTIONS = [
+    pytest.param(
+        lambda target, fragment: target.append(fragment), '<div id="a"><i></i><b></b><u></u></div>', id="append"
+    ),
+    pytest.param(
+        lambda target, fragment: target.extend([fragment, Element("s")]),
+        '<div id="a"><i></i><b></b><u></u><s></s></div>',
+        id="extend",
+    ),
+    pytest.param(
+        lambda target, fragment: target.insert(0, fragment), '<div id="a"><b></b><u></u><i></i></div>', id="insert"
+    ),
+    pytest.param(
+        lambda target, fragment: target.children[0].insert_before(fragment),
+        '<div id="a"><b></b><u></u><i></i></div>',
+        id="insert-before",
+    ),
+    pytest.param(
+        lambda target, fragment: target.children[0].insert_after(fragment),
+        '<div id="a"><i></i><b></b><u></u></div>',
+        id="insert-after",
+    ),
+    pytest.param(
+        lambda target, fragment: target.children[0].replace_with(fragment),
+        '<div id="a"><b></b><u></u></div>',
+        id="replace-with",
+    ),
+    pytest.param(
+        lambda target, fragment: Range(target, 1).insert_node(fragment),
+        '<div id="a"><i></i><b></b><u></u></div>',
+        id="range-insert-node",
+    ),
+]
+
+
+@pytest.mark.parametrize(("insert", "expected"), _INSERTIONS)
+def test_inserting_a_fragment_places_its_children(
+    insert: Callable[[Element, DocumentFragment], object], expected: str
+) -> None:
+    _, target = _host_page()
+    insert(target, _fragment("b", "u"))
+    assert target.html == expected
+
+
+@pytest.mark.parametrize(("insert", "expected"), _INSERTIONS)
+def test_inserting_a_fragment_empties_it(insert: Callable[[Element, DocumentFragment], object], expected: str) -> None:
+    _, target = _host_page()
+    fragment = _fragment("b", "u")
+    insert(target, fragment)
+    assert (target.html, fragment.children) == (expected, ())
+
+
+def test_inserting_a_same_tree_fragment_moves_its_children() -> None:
+    _, target = _host_page()
+    boundary = Range(target, 0)
+    boundary.set_end(target, 1)
+    fragment = boundary.extract_contents()
+    target.append(Element("b"))
+    target.append(fragment)
+    assert (target.html, fragment.children) == ('<div id="a"><b></b><i></i></div>', ())
+
+
+def test_element_constructor_places_a_fragment_s_children() -> None:
+    assert Element("p", children=[_fragment("b", "u"), Text("t")]).html == "<p><b></b><u></u>t</p>"
+
+
+def test_element_constructor_places_a_lone_fragment_s_children() -> None:
+    assert Element("p", children=[_fragment("b", "u")]).html == "<p><b></b><u></u></p>"
+
+
+def test_element_constructor_takes_a_tuple_of_one_child() -> None:
+    assert Element("p", children=(Text("t"),)).html == "<p>t</p>"
+
+
+def test_range_insert_of_a_fragment_extends_a_collapsed_range() -> None:
+    _, target = _host_page()
+    boundary = Range(target, 1)
+    boundary.insert_node(_fragment("b", "u"))
+    assert (boundary.start_offset, boundary.end_offset) == (1, 3)
+
+
+def test_appending_a_shadow_root_moves_its_children() -> None:
+    host = Element("div")
+    root = host.attach_shadow("open")
+    root.append(Element("span"))
+    _, target = _host_page()
+    target.append(root)
+    assert (target.html, root.children, root.host == host) == ('<div id="a"><i></i><span></span></div>', (), True)
+
+
+def test_appending_a_same_tree_shadow_root_keeps_it_attached() -> None:
+    document, target = _host_page()
+    root = target.attach_shadow("open")
+    root.append(Comment("c"))
+    body = document.select_one("body")
+    assert body is not None
+    body.append(root)
+    assert (body.html, target.shadow_root == root) == ('<body><div id="a"><i></i></div><!--c--></body>', True)
+
+
+def test_a_template_s_contents_move_out_and_the_template_keeps_its_fragment() -> None:
+    document = parse("<template><b>x</b></template><div id=a></div>")
+    template = document.select_one("template")
+    target = document.select_one("#a")
+    assert template is not None
+    assert target is not None
+    content = template.children[0]
+    assert isinstance(content, DocumentFragment)
+    target.append(content)
+    assert (target.html, template.children, content.children) == ('<div id="a"><b>x</b></div>', (content,), ())
+
+
+@pytest.mark.parametrize(
+    "insert",
+    [
+        pytest.param(lambda fragment: fragment.append(fragment), id="into-itself"),
+        pytest.param(lambda fragment: fragment.children[0].append(fragment), id="into-its-child"),
+    ],
+)
+def test_a_fragment_cannot_go_into_itself(insert: Callable[[DocumentFragment], object]) -> None:
+    fragment = _fragment("b")
+    with pytest.raises(ValueError, match="own subtree"):
+        insert(fragment)
+
+
+def test_a_fragment_holding_two_elements_cannot_become_a_document_s_root() -> None:
+    document = parse("<!DOCTYPE html><html></html>")
+    root = document.root
+    assert root is not None
+    with pytest.raises(ValueError, match="only one element"):
+        root.replace_with(_fragment("a", "b"))
+
+
+@pytest.mark.parametrize(
+    ("argument", "message"),
+    [
+        pytest.param("x", "must be a node", id="non-node"),
+        pytest.param(parse(""), "Document cannot be inserted", id="document"),
+    ],
+)
+def test_sibling_insert_rejects_a_bad_argument_before_moving_anything(argument: object, message: str) -> None:
+    _, target = _host_page()
+    first = Element("b")
+    with pytest.raises(TypeError, match=message):
+        target.children[0].insert_before(first, argument)  # ty: ignore[invalid-argument-type]
+    assert target.html == '<div id="a"><i></i></div>'
