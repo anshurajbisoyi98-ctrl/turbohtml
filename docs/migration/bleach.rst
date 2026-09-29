@@ -10,7 +10,7 @@ URL schemes so user-supplied HTML is safe to render, and ``bleach.linkify`` scan
 ``<a>`` tags. It powered comment fields, wikis, and message bodies across the Django ecosystem for a decade.
 
 bleach reached end of life with no maintained successor. turbohtml covers both jobs from its ``turbohtml.clean`` module:
-``bleach.clean`` maps to the allowlist :class:`~turbohtml.clean.Sanitizer` (with a drop-in
+``bleach.clean`` maps to the allowlist :class:`~turbohtml.clean.Sanitizer` (with a compatible
 :func:`turbohtml.migration.bleach.clean` shim), and ``bleach.linkify`` maps to :func:`turbohtml.clean.linkify`. Both run
 their filtering in C, ship full type annotations, and take a frozen, thread-safe configuration.
 
@@ -101,7 +101,7 @@ The sanitizer leads bleach by about fifty times and the linkifier by six to twen
 Sanitizing
 ==========
 
-The bleach-compatible shim keeps ``clean``'s signature, so the import is the only change:
+The bleach-compatible shim keeps ``clean``'s signature, so most calls need only an import change:
 
 .. code-block:: python
 
@@ -143,13 +143,19 @@ chooses between dropping a disallowed tag and keeping its children (``True``) an
 
     &lt;p&gt;Hi <a href="http://x">link</a>&lt;/p&gt;&lt;script&gt;evil()&lt;/script&gt;
 
+Kept attributes and text may have different entity spelling: bleach preserves ``&#x20;`` while turbohtml emits a space.
+The parsed value is the same.
+
 For new code prefer the native :class:`~turbohtml.clean.Policy`/:class:`~turbohtml.clean.Sanitizer` API: a frozen,
 thread-safe policy, an :class:`~turbohtml.clean.OnDisallowed` enum that names escape, strip, and remove where bleach
 overloaded two booleans, and an ``attribute_filter`` that rewrites or drops a value where bleach's callable only
 returned a bool.
 
-To retain bleach attribute rules alongside native CSS settings, use ``attribute_policy``. Tag-specific and ``"*"`` rules
-both apply; either can admit an attribute. Callbacks run only if preceding rules did not admit it.
+To retain bleach attribute rules alongside native CSS settings, use ``attribute_policy``. A tag-specific callable
+decides whether to keep the attribute. A tag-specific list admits its listed names and falls back to the ``"*"`` rule
+for others. Static lists and sets compile to native allowlists. Callable and custom membership rules retain the source
+mapping, so changes during sanitization affect later attributes. Pass the returned predicate to ``attribute_predicate``
+to inspect source values before URL and CSS checks.
 
 .. testcode::
 
@@ -157,7 +163,7 @@ both apply; either can admit an attribute. Callbacks run only if preceding rules
     from turbohtml.migration.bleach import attribute_policy
 
     names, predicate = attribute_policy({"a": ["href"], "*": lambda _tag, name, _value: name == "style"})
-    policy = Policy(attributes=names, attribute_filter=predicate, css_properties=frozenset({"color"}))
+    policy = Policy(attributes=names, attribute_predicate=predicate, css_properties=frozenset({"color"}))
     print(sanitize('<a href="/x" style="color: red; position: fixed">link</a>', policy))
 
 .. testoutput::

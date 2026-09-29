@@ -152,7 +152,8 @@ def _register_article(article_type: type, /) -> None: ...
 def _register_locations(location_type: type, span_type: type, /) -> None: ...
 def _bleach_attributes(
     attributes: object, mapping_type: type, /
-) -> tuple[dict[str, frozenset[str]], Callable[[str, str, str], str | None] | None]: ...
+) -> tuple[dict[str, frozenset[str]], Callable[[str, str, str], bool] | None]: ...
+def _bleach_allow_relative(schemes: frozenset[str], /) -> bool: ...
 def _sanitize_policy(
     attributes: Mapping[str, frozenset[str]],
     add_link_rel: Iterable[str],
@@ -176,6 +177,7 @@ def _sanitize(
     attributes: Mapping[str, frozenset[str]],
     url_schemes: frozenset[str],
     allow_relative: bool,
+    allow_fragments: bool,
     on_disallowed: int,
     strip_comments: bool,
     add_link_rel: str | None,
@@ -198,6 +200,7 @@ def _sanitize(
     allow_svg: bool,
     allow_mathml: bool,
     attribute_predicate: Callable[[str, str, str], bool] | None,
+    bleach_url_policy: bool,
     /,
 ) -> Node: ...
 def annotation_surface(text: str, spans: Iterable[tuple[int, int, str]], /) -> dict[str, list[str]]: ...

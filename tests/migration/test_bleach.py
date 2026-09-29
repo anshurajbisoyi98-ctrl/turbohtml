@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 import pytest
 
@@ -17,11 +17,11 @@ if TYPE_CHECKING:
     ("rules", "expected"),
     [
         pytest.param({"a": ["href"], "*": lambda *_: False}, '<a href="/x">text</a>', id="listed-tag"),
-        pytest.param({"a": lambda *_: False, "*": ["title"]}, '<a title="t">text</a>', id="listed-wildcard"),
+        pytest.param({"a": lambda *_: False, "*": ["title"]}, "<a>text</a>", id="predicate-before-wildcard"),
         pytest.param(
             {"a": lambda _tag, name, _value: name == "href", "*": lambda _tag, name, _value: name == "title"},
-            '<a href="/x" title="t">text</a>',
-            id="combined-predicates",
+            '<a href="/x">text</a>',
+            id="tag-predicate",
         ),
         pytest.param(
             {"a": [], "*": lambda _tag, name, _value: name == "title"}, '<a title="t">text</a>', id="empty-tag"
@@ -31,12 +31,14 @@ if TYPE_CHECKING:
         pytest.param({"a": ["href", "title"]}, '<a href="/x" title="t">text</a>', id="no-predicates"),
     ],
 )
-def test_attribute_policy_combines_tag_and_wildcard_rules(
+def test_attribute_policy_preserves_tag_and_wildcard_precedence(
     rules: Mapping[str, Iterable[str] | Callable[[str, str, str], bool]], expected: str
 ) -> None:
-    names, attribute_filter = attribute_policy(rules)
+    names, attribute_predicate = attribute_policy(rules)
     assert (
-        sanitize('<a href="/x" title="t" rel="r">text</a>', Policy(attributes=names, attribute_filter=attribute_filter))
+        sanitize(
+            '<a href="/x" title="t" rel="r">text</a>', Policy(attributes=names, attribute_predicate=attribute_predicate)
+        )
         == expected
     )
 
@@ -146,27 +148,30 @@ def test_a_flat_list_admits_its_names_on_every_tag() -> None:
 
 
 def test_a_callable_admits_every_name_and_judges_each_value() -> None:
-    names, judge = _bleach_attributes(lambda _tag, name, _value: name == "href", Mapping)
+    names, judge = attribute_policy(lambda _tag, name, _value: name == "href")
     assert names == {"*": frozenset({"*"})}
     assert judge is not None
-    assert (judge("a", "href", "/x"), judge("a", "title", "t")) == ("/x", None)
+    assert (judge("a", "href", "/x"), judge("a", "title", "t")) == (True, False)
 
 
-def test_a_mapping_lists_names_per_tag_and_binds_its_callables() -> None:
-    names, judge = _bleach_attributes({"a": lambda _tag, name, _value: name == "href", "b": ["data-z"]}, Mapping)
-    assert names == {"a": frozenset({"*"}), "b": frozenset({"data-z"})}
-    assert judge is not None
-    assert (judge("a", "href", "/x"), judge("a", "rel", "r"), judge("b", "data-z", "1")) == ("/x", None, "1")
+def test_per_tag_callable_leaves_other_tag_lists_intact() -> None:
+    assert (
+        clean(
+            '<a href="/x" rel="r">x</a><b data-z="1">y</b>',
+            attributes={"a": lambda _tag, name, _value: name == "href", "b": ["data-z"]},
+        )
+        == '<a href="/x">x</a><b data-z="1">y</b>'
+    )
 
 
 def test_a_wildcard_callable_is_the_fallback_for_other_tags() -> None:
-    _, judge = _bleach_attributes({"*": lambda _tag, name, _value: name == "title", "a": lambda *_: True}, Mapping)
+    _, judge = attribute_policy({"*": lambda _tag, name, _value: name == "title", "a": lambda *_: True})
     assert judge is not None
-    assert (judge("a", "x", "1"), judge("p", "title", "t"), judge("p", "x", "1")) == ("1", "t", None)
+    assert (judge("a", "x", "1"), judge("p", "title", "t"), judge("p", "x", "1")) == (True, True, False)
 
 
-def test_a_mapping_without_callables_binds_no_filter() -> None:
-    assert _bleach_attributes({"a": ["href"]}, Mapping)[1] is None
+def test_a_mapping_without_callables_binds_no_predicate() -> None:
+    assert attribute_policy({"a": ["href"]})[1] is None
 
 
 def test_a_predicate_error_propagates() -> None:
@@ -195,7 +200,7 @@ def test_a_verdict_that_cannot_be_judged_propagates() -> None:
         bound("a", "href", "/x")
 
 
-def test_the_filter_takes_three_arguments() -> None:
+def test_the_predicate_takes_three_arguments() -> None:
     _, bound = _bleach_attributes(lambda *_: True, Mapping)
     assert bound is not None
     with pytest.raises(TypeError):
@@ -204,11 +209,15 @@ def test_the_filter_takes_three_arguments() -> None:
 
 @pytest.mark.parametrize(
     "attributes",
-    [pytest.param(5, id="not-iterable"), pytest.param({"a": 5}, id="a-tag-listing-a-non-iterable")],
+    [
+        pytest.param(5, id="not-iterable"),
+        pytest.param({"a": 5}, id="a-tag-listing-a-non-iterable"),
+        pytest.param({"a": [["href"]]}, id="unhashable-attribute-name"),
+    ],
 )
 def test_a_shape_that_lists_nothing_is_rejected(attributes: object) -> None:
     with pytest.raises(TypeError):
-        _bleach_attributes(attributes, Mapping)
+        clean('<a href="/x">x</a>', attributes=cast("list[str]", attributes))
 
 
 def test_the_entry_takes_two_arguments() -> None:
