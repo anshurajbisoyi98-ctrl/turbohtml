@@ -1,2 +1,0 @@
-Assigning :attr:`Element.tag <turbohtml.Element.tag>` renames the element in place, keeping its namespace, attributes,
-children and position.

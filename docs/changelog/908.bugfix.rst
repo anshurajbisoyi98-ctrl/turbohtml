@@ -1,1 +1,0 @@
-Avoid repeated attribute-name length calculations during XSLT execution.

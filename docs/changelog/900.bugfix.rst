@@ -1,1 +1,0 @@
-Keep cloned element attributes independent during DOM edits and sanitization.

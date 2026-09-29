@@ -7,6 +7,73 @@
 .. towncrier release notes start
 
 **********************
+ v1.11.0 (2026-09-29)
+**********************
+
+Features - 1.11.0
+=================
+
+- Add ``Markdown.Escaping(mode="none")``, which leaves prose as written in :meth:`~turbohtml.Node.to_markdown` apart
+  from the ``asterisks`` and ``underscores`` choices and a ``|`` inside a table cell. (:issue:`874`)
+- Assigning :attr:`Element.tag <turbohtml.Element.tag>` renames the element in place, keeping its namespace, attributes,
+  children and position. (:issue:`883`)
+- Add :func:`turbohtml.migration.bleach.attribute_policy` for retaining bleach attribute rules with native CSS settings.
+  Preserve callable precedence, source values before safety checks, and changes to rule mappings. Treat ``*`` as an
+  attribute name. (:issue:`895`)
+- Add ``Policy.attribute_predicate`` to inspect attributes before allowlist and safety checks. (:issue:`901`)
+
+Bug fixes - 1.11.0
+==================
+
+- :meth:`~turbohtml.Node.to_markdown` keeps a list's content that is not an ``<li>``: text or a block before the first
+  item renders on its own, one after an item continues it, and items wrapped in another element keep their markers.
+  (:issue:`864`)
+- :meth:`~turbohtml.Node.to_markdown` keeps a table's ``<caption>``, rendering it as a paragraph above the pipe table
+  and the stripped table text. (:issue:`865`)
+- :meth:`~turbohtml.Node.to_markdown` ends each pipe-table row at its closing ``|`` with no trailing space, and a cell
+  that holds a block no longer starts with two spaces. (:issue:`866`)
+- :meth:`~turbohtml.Node.to_markdown` keeps two adjacent lists of the same kind apart: the second switches its bullet or
+  ordered delimiter, since CommonMark joins items that share one into a single list. (:issue:`867`)
+- :meth:`~turbohtml.Node.to_markdown` keeps whitespace at the edges of a link or a converted inline element outside its
+  output, so ``x<a href="h"> t </a>y`` renders ``x [t](h) y`` where the leading space used to vanish. (:issue:`868`)
+- An absolute XPath or ``id()`` evaluated on a node outside any document, such as an element built with ``Element(...)``
+  or held by a ``DocumentFragment``, now starts at the root of that node's tree instead of crashing the interpreter.
+  (:issue:`876`)
+- ``hash()`` on a node no longer slows down as its tree takes in nodes from other trees: the hashes those nodes carried
+  over now sit in a hash table instead of a list scanned on every call. (:issue:`878`)
+- Negative child indexes on PyPy 8.0 no longer get the sequence length added twice, so ``node[-len(node) - 1]`` raises
+  :class:`IndexError` again instead of returning a child. (:issue:`879`)
+- Setting an attribute accepts every name the DOM Standard allows, including a quote, ``<`` or a control character the
+  parser keeps from markup; only ASCII whitespace, U+0000, ``/``, ``=`` and ``>`` are rejected. (:issue:`881`)
+- An XPath descendant step without a predicate, such as the second step of ``.//div//a``, no longer runs in quadratic
+  time when its context nodes nest inside one another. (:issue:`885`)
+- Moving a subtree between trees preserves references to its descendants and their attribute views. Aliases of the moved
+  node retain their identity and hashes. (:issue:`887`)
+- Source installs on Windows activate MSVC even when MinGW is on ``PATH``. This prevents ARM64 builds from selecting an
+  x64 compiler and failing to link Python. (:issue:`888`)
+- Predicate-free XPath descendant steps skip nested contexts during traversal. Deep trees no longer require a separate
+  ancestor walk for each context. (:issue:`890`)
+- Reduce Markdown conversion overhead by inlining child dispatch and skipping converter calls without configured
+  converters. (:issue:`893`)
+- Render ``kbd`` and ``samp`` as Markdown code spans with safe backtick fences. Omit empty inline code spans.
+  (:issue:`896`)
+- Speed up XPath ``re:test()`` and ``matches()`` predicates by reusing compiled regular expressions. (:issue:`897`)
+- Reuse parent styles and CSS sibling positions across computed-style calls and reverse traversal. (:issue:`898`)
+- Reject unmatched brackets in URL authorities during sanitization, including rewritten and forced attributes. Preserve
+  bracketed hostnames and brackets outside the authority. (:issue:`899`)
+- Keep cloned element attributes independent during DOM edits and sanitization. (:issue:`900`)
+- Fix XSLT transforms of standalone and detached nodes, including document fragments. Keep source trees alive across
+  callbacks. (:issue:`902`)
+- Reuse compiled stylesheet text to reduce XSLT allocations. (:issue:`904`)
+- Honor form ownership and tree boundaries when setting a radio input's ``checked`` state. (:issue:`905`)
+- Reduce query ordering costs for large sets of sibling roots. (:issue:`906`)
+- Reduce parent query costs for nodes without siblings. (:issue:`907`)
+- Avoid repeated attribute-name length calculations during XSLT execution. (:issue:`908`)
+- Retain attribute predicates when callbacks clear the ``attrs`` mapping during ``find()`` or ``find_all()``.
+  (:issue:`910`)
+- Count default XSLT numbers by expanded name and processing-instruction target. (:issue:`911`)
+
+**********************
  v1.10.0 (2026-09-24)
 **********************
 
