@@ -7,6 +7,16 @@
 .. towncrier release notes start
 
 **********************
+ v1.12.0 (2026-09-29)
+**********************
+
+Features - 1.12.0
+=================
+
+- Use :meth:`~turbohtml.Node.iter_elements` for lazy, tag-filtered traversal of large trees. The iterator keeps its next
+  match across edits and follows the tree that then contains it. (:issue:`915`)
+
+**********************
  v1.11.0 (2026-09-29)
 **********************
 
