@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import json
+import re
+import subprocess  # ruff:ignore[suspicious-subprocess-import]
+import sys
 from concurrent.futures import ThreadPoolExecutor
 from typing import TYPE_CHECKING, Final
 
@@ -162,10 +166,88 @@ def test_facets(facets: str, base: str, value: str, ok: bool) -> None:  # ruff:i
         pytest.param("colou?r", "color", True, id="optional-u"),
         pytest.param("a*", "", True, id="star-empty"),
         pytest.param(r"a\.b", "a.b", True, id="escaped-dot"),
+        pytest.param("(){999999999999}", "", True, id="huge-count-of-empty-group"),
     ],
 )
 def test_regex_pattern(pattern: str, value: str, ok: bool) -> None:  # ruff:ignore[boolean-type-hint-positional-argument]  # a pytest parametrize value, not a boolean-trap call site
     assert check(restricted(f'<xs:pattern value="{pattern}"/>'), f"<v>{value}</v>").valid is ok
+
+
+_NESTING_ERROR: Final[str] = (
+    "schema pattern nests groups deeper than 250 levels at offset 250; flatten the nested groups"
+)
+_STATES_ERROR: Final[str] = (
+    "schema pattern needs more than 2000000 NFA states; lower its repeat counts or split it into several patterns"
+)
+
+
+@pytest.mark.parametrize(
+    ("pattern", "message"),
+    [
+        pytest.param("(" * 50000 + "a" + ")" * 50000, _NESTING_ERROR, id="nested-groups"),
+        pytest.param("(" * 251 + "a" + ")" * 251, _NESTING_ERROR, id="nesting-one-past-cap"),
+        pytest.param("(a{5000}){5000}", _STATES_ERROR, id="repeat-product"),
+        pytest.param("(a{0,3000}){0,3000}", _STATES_ERROR, id="optional-repeat-product"),
+        pytest.param("a{999999999999}", _STATES_ERROR, id="huge-count"),
+        pytest.param(
+            "a{5,2}",
+            "schema pattern quantifier {5,2} at offset 1 has its minimum above its maximum",
+            id="inverted-bound",
+        ),
+    ],
+)
+def test_regex_pattern_past_a_limit_raises(pattern: str, message: str) -> None:
+    with pytest.raises(ValueError, match=f"^{re.escape(message)}$"):
+        XMLSchema(restricted(f'<xs:pattern value="{pattern}"/>'))
+
+
+def test_regex_patterns_of_different_sizes_share_the_match_buffers() -> None:
+    # the match buffers are sized once per validate() call by the largest pattern, so a smaller pattern compiled after
+    # a larger one must not shrink them
+    schema = XMLSchema(
+        f'<xs:schema {XS}><xs:element name="r"><xs:complexType><xs:sequence>'
+        '<xs:element name="big"><xs:simpleType><xs:restriction base="xs:string"><xs:pattern value="a{2000}"/>'
+        "</xs:restriction></xs:simpleType></xs:element>"
+        '<xs:element name="small"><xs:simpleType><xs:restriction base="xs:string"><xs:pattern value="b"/>'
+        "</xs:restriction></xs:simpleType></xs:element>"
+        "</xs:sequence></xs:complexType></xs:element></xs:schema>"
+    )
+    results = [
+        schema.validate(parse_xml(f"<r><big>{big}</big><small>{small}</small></r>")).valid
+        for big, small in (("a" * 2000, "b"), ("a" * 1999, "b"), ("a" * 2000, "c"))
+    ]
+    assert results == [True, False, False]
+
+
+@pytest.mark.parametrize(
+    ("pattern", "value"),
+    [
+        pytest.param("a{150000}", "a" * 150000, id="large-repeat"),
+        pytest.param("a" * 200000, "a" * 200000, id="long-literal"),
+        pytest.param("a" + "|a" * 100000, "a", id="long-alternation"),
+        pytest.param("(" * 250 + "a" + ")" * 250, "a", id="nesting-at-cap"),
+    ],
+)
+def test_regex_large_pattern_compiles_and_matches(pattern: str, value: str) -> None:
+    # compiling and matching both walk these patterns without recursing per piece, so they fit the 128 KiB thread
+    # stack uv's musl CPython starts threads with; a subprocess turns a regression into a clean failure instead of a
+    # killed worker, and the input goes in on stdin because Linux caps a single command-line argument at 128 KiB
+    code = (
+        "import json, sys, threading\nfrom turbohtml import parse_xml\nfrom turbohtml.validate import XMLSchema\n"
+        "data = json.load(sys.stdin)\nthreading.stack_size(128 * 1024)\n"
+        "run = lambda: print(XMLSchema(data['schema']).validate(parse_xml(data['xml'])).valid)\n"
+        "worker = threading.Thread(target=run)\n"
+        "worker.start()\nworker.join()\n"
+    )
+    result = subprocess.run(  # ruff:ignore[subprocess-without-shell-equals-true]
+        [sys.executable, "-c", code],
+        input=json.dumps({"schema": restricted(f'<xs:pattern value="{pattern}"/>'), "xml": f"<v>{value}</v>"}),
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
+    )
+    assert (result.returncode, result.stdout) == (0, "True\n"), result.stderr
 
 
 def test_sequence_and_occurs() -> None:

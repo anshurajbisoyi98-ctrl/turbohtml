@@ -11,6 +11,16 @@
 #ifndef TURBOHTML_VALIDATE_REGEX_H
 #define TURBOHTML_VALIDATE_REGEX_H
 
+/* Bounds that keep an adversarial pattern from exhausting the C stack or memory. The quantifier compiler is iterative,
+   so any repeat count is stack-safe and only the total NFA state count is bounded. Group nesting drives the recursive
+   parser, so it takes the 250 levels PCRE2 (PARENS_NEST_LIMIT) and Rust's regex-syntax (nest_limit) allow for the
+   same reason: a musl thread from uv's python-build-standalone gets a 130 KiB stack, which 1000 levels overflow. */
+#define RX_MAX_GROUP_DEPTH 250
+
+/* Why a pattern failed to compile; each maps to its own error in regex_cache_add. */
+enum { RX_FAIL_MEMORY = 1, RX_FAIL_NESTING, RX_FAIL_BOUND, RX_FAIL_STATES };
+#define RX_MAX_STATES 2000000
+
 enum {
     RX_BD = 1,  /* \d */
     RX_BW = 2,  /* \w */
@@ -57,6 +67,8 @@ typedef struct {
     Py_ssize_t len, pos;
     arena *mem;
     int failed;
+    Py_ssize_t fail_pos, fail_end; /* the span a nesting or bound error points at */
+    int depth;                     /* open groups on the recursion path, capped at RX_MAX_GROUP_DEPTH */
 } rparser;
 
 static rnode *rx_node(rparser *parser, int type) {
@@ -199,8 +211,15 @@ static rnode *rx_class_from_builtin(rparser *parser, int flag) {
 static rnode *rx_parse_atom(rparser *parser) {
     Py_UCS4 current = parser->pattern[parser->pos];
     if (current == '(') {
+        if (parser->depth >= RX_MAX_GROUP_DEPTH) {
+            parser->failed = RX_FAIL_NESTING;
+            parser->fail_pos = parser->pos;
+            return NULL;
+        }
         parser->pos++;
+        parser->depth++;
         rnode *inner = rx_parse_alt(parser);
+        parser->depth--;
         /* rx_parse_alt stops at ')' or end of input, so a remaining char here is the ')' */
         if (parser->pos < parser->len) {
             parser->pos++;
@@ -236,37 +255,48 @@ static rnode *rx_parse_atom(rparser *parser) {
     return node;
 }
 
+/* Read a run of decimal digits as a quantifier count, saturating at the state budget: a larger count can never compile
+   within it, and saturating keeps the arithmetic from overflowing and an empty-atom repeat such as (){999999999999}
+   from looping without creating states. Returns the digit count. */
+static Py_ssize_t rx_parse_count(rparser *parser, int *count) {
+    Py_ssize_t digits = 0;
+    int value = 0;
+    while (parser->pos < parser->len && parser->pattern[parser->pos] >= '0' && parser->pattern[parser->pos] <= '9') {
+        int digit = (int)(parser->pattern[parser->pos++] - '0');
+        value = value > (RX_MAX_STATES - digit) / 10 ? RX_MAX_STATES : value * 10 + digit;
+        digits++;
+    }
+    *count = value;
+    return digits;
+}
+
 /* Parse a {m}, {m,} or {m,n} quantifier starting at the '{'. Returns 1 with rmin and
    rmax set (rmax -1 for unbounded), or 0 leaving pos unchanged when not a quantifier. */
 static int rx_parse_bound(rparser *parser, int *rmin, int *rmax) {
     Py_ssize_t save = parser->pos;
     parser->pos++; /* past '{' */
-    Py_ssize_t low = 0, digits = 0;
-    while (parser->pos < parser->len && parser->pattern[parser->pos] >= '0' && parser->pattern[parser->pos] <= '9') {
-        low = low * 10 + (parser->pattern[parser->pos++] - '0');
-        digits++;
-    }
-    if (digits == 0) {
+    int low = 0;
+    if (rx_parse_count(parser, &low) == 0) {
         parser->pos = save;
         return 0;
     }
-    int high = (int)low;
+    int high = low;
     if (parser->pos < parser->len && parser->pattern[parser->pos] == ',') {
         parser->pos++;
-        Py_ssize_t hi = 0, hi_digits = 0;
-        while (parser->pos < parser->len && parser->pattern[parser->pos] >= '0' &&
-               parser->pattern[parser->pos] <= '9') {
-            hi = hi * 10 + (parser->pattern[parser->pos++] - '0');
-            hi_digits++;
-        }
-        high = hi_digits == 0 ? -1 : (int)hi;
+        int hi = 0;
+        high = rx_parse_count(parser, &hi) == 0 ? -1 : hi;
     }
     if (parser->pos >= parser->len || parser->pattern[parser->pos] != '}') {
         parser->pos = save;
         return 0;
     }
     parser->pos++;
-    *rmin = (int)low;
+    if (high != -1 && low > high) {
+        parser->failed = RX_FAIL_BOUND;
+        parser->fail_pos = save;
+        parser->fail_end = parser->pos;
+    }
+    *rmin = low;
     *rmax = high;
     return 1;
 }
@@ -343,13 +373,19 @@ typedef struct {
     arena *mem;
     size_t count;
     int failed;
+    rstate sink; /* absorbs writes once the pattern is refused, so no caller dereferences NULL */
 } rcompiler;
 
 static rstate *rx_state(rcompiler *compiler, int kind) {
-    rstate *state = arena_alloc(compiler->mem, sizeof(rstate));
-    if (state == NULL) {      /* GCOVR_EXCL_BR_LINE: arena OOM is unforceable */
-        compiler->failed = 1; /* GCOVR_EXCL_LINE */
-        return NULL;          /* GCOVR_EXCL_LINE */
+    rstate *state = NULL;
+    if (compiler->count >= RX_MAX_STATES) {
+        compiler->failed = RX_FAIL_STATES;
+    } else if ((state = arena_alloc(compiler->mem, sizeof(rstate))) == NULL) { /* GCOVR_EXCL_BR_LINE: arena OOM */
+        compiler->failed = RX_FAIL_MEMORY;                                     /* GCOVR_EXCL_LINE */
+    } /* GCOVR_EXCL_LINE: arena OOM */
+    if (state == NULL) {
+        /* a refused pattern keeps compiling into the sink, and the repeat loops stop once `failed` is set */
+        state = &compiler->sink;
     }
     memset(state, 0, sizeof(*state));
     state->kind = kind;
@@ -359,31 +395,30 @@ static rstate *rx_state(rcompiler *compiler, int kind) {
 
 static rstate *rx_compile(rcompiler *compiler, rnode *node, rstate *out);
 
+/* Compile `node->a{rmin,rmax}` (rmax -1 for unbounded) iteratively, so a huge repeat count grows the NFA without
+   growing the C stack; rx_state's budget bounds the memory, and the loops stop once it trips. An inverted bound such
+   as {5,2} compiles as {5,}, as the recursive construction always did. */
 static rstate *rx_compile_repeat(rcompiler *compiler, rnode *node, int rmin, int rmax, rstate *out) {
-    if (rmin > 0) {
-        rstate *tail = rx_compile_repeat(compiler, node, rmin - 1, rmax < 0 ? -1 : rmax - 1, out);
-        return tail == NULL ? NULL : rx_compile(compiler, node->a, tail); /* GCOVR_EXCL_BR_LINE: NULL only on OOM */
+    if (rmax < rmin) {
+        rmax = -1;
     }
+    rstate *cur = out;
     if (rmax < 0) {
         rstate *split = rx_state(compiler, RS_SPLIT);
-        if (split == NULL) { /* GCOVR_EXCL_BR_LINE: arena OOM is unforceable */
-            return NULL;     /* GCOVR_EXCL_LINE */
-        }
         split->out1 = out;
         split->out = rx_compile(compiler, node->a, split);
-        return split;
+        cur = split;
     }
-    if (rmax == 0) {
-        return out;
+    for (int optional = rmax - rmin; optional > 0 && !compiler->failed; optional--) {
+        rstate *split = rx_state(compiler, RS_SPLIT);
+        split->out1 = out;
+        split->out = rx_compile(compiler, node->a, cur);
+        cur = split;
     }
-    rstate *split = rx_state(compiler, RS_SPLIT);
-    if (split == NULL) { /* GCOVR_EXCL_BR_LINE: arena OOM is unforceable */
-        return NULL;     /* GCOVR_EXCL_LINE */
+    for (int required = 0; required < rmin && !compiler->failed; required++) {
+        cur = rx_compile(compiler, node->a, cur);
     }
-    rstate *tail = rx_compile_repeat(compiler, node, 0, rmax - 1, out);
-    split->out1 = out;
-    split->out = tail == NULL ? NULL : rx_compile(compiler, node->a, tail); /* GCOVR_EXCL_BR_LINE: NULL only on OOM */
-    return split;
+    return cur;
 }
 
 /* Compile an AST node into an NFA fragment whose every exit flows to `out`. */
@@ -398,9 +433,6 @@ static rstate *rx_compile(rcompiler *compiler, rnode *node, rstate *out) {
     case RN_ANY:
     case RN_CLASS: {
         rstate *state = rx_state(compiler, RS_MATCH);
-        if (state == NULL) { /* GCOVR_EXCL_BR_LINE: arena OOM is unforceable */
-            return NULL;     /* GCOVR_EXCL_LINE */
-        }
         state->mkind = node->type;
         state->ch = node->ch;
         state->cls = node->cls;
@@ -408,41 +440,46 @@ static rstate *rx_compile(rcompiler *compiler, rnode *node, rstate *out) {
         return state;
     }
     case RN_CONCAT: {
-        rstate *tail = rx_compile(compiler, node->b, out);
-        return tail == NULL ? NULL : rx_compile(compiler, node->a, tail); /* GCOVR_EXCL_BR_LINE: NULL only on OOM */
+        /* the parser builds a concatenation as a left-leaning chain, so walk that spine iteratively: a long pattern
+           has a chain as deep as its length, which recursion could not descend without overflowing the stack */
+        rstate *tail = out;
+        rnode *cur = node;
+        while (cur->type == RN_CONCAT) {
+            tail = rx_compile(compiler, cur->b, tail);
+            cur = cur->a;
+        }
+        return rx_compile(compiler, cur, tail);
     }
     case RN_ALT: {
-        rstate *split = rx_state(compiler, RS_SPLIT);
-        if (split == NULL) { /* GCOVR_EXCL_BR_LINE: arena OOM is unforceable */
-            return NULL;     /* GCOVR_EXCL_LINE */
+        /* likewise flatten the left-leaning alternation chain: each split's deep left child is threaded through `link`
+           so a long `a|b|c|...` compiles without recursing once per alternative */
+        rstate *result = NULL;
+        rstate **link = &result;
+        rnode *cur = node;
+        while (cur->type == RN_ALT) {
+            rstate *split = rx_state(compiler, RS_SPLIT);
+            split->out1 = rx_compile(compiler, cur->b, out);
+            *link = split;
+            link = &split->out;
+            cur = cur->a;
         }
-        split->out = rx_compile(compiler, node->a, out);
-        split->out1 = rx_compile(compiler, node->b, out);
-        return split;
+        *link = rx_compile(compiler, cur, out);
+        return result;
     }
     case RN_QUEST: {
         rstate *split = rx_state(compiler, RS_SPLIT);
-        if (split == NULL) { /* GCOVR_EXCL_BR_LINE: arena OOM is unforceable */
-            return NULL;     /* GCOVR_EXCL_LINE */
-        }
         split->out = rx_compile(compiler, node->a, out);
         split->out1 = out;
         return split;
     }
     case RN_STAR: {
         rstate *split = rx_state(compiler, RS_SPLIT);
-        if (split == NULL) { /* GCOVR_EXCL_BR_LINE: arena OOM is unforceable */
-            return NULL;     /* GCOVR_EXCL_LINE */
-        }
         split->out1 = out;
         split->out = rx_compile(compiler, node->a, split);
         return split;
     }
     case RN_PLUS: {
         rstate *split = rx_state(compiler, RS_SPLIT);
-        if (split == NULL) { /* GCOVR_EXCL_BR_LINE: arena OOM is unforceable */
-            return NULL;     /* GCOVR_EXCL_LINE */
-        }
         split->out1 = out;
         rstate *start = rx_compile(compiler, node->a, split);
         split->out = start;
@@ -512,21 +549,46 @@ static int regex_cache_add(th_schema *schema, const Py_UCS4 *text, Py_ssize_t le
     if (pattern == NULL) { /* GCOVR_EXCL_BR_LINE: arena OOM is unforceable */
         return -1;         /* GCOVR_EXCL_LINE */
     }
-    rparser parser = {text, len, 0, &schema->mem, 0};
+    rparser parser = {.pattern = text, .len = len, .mem = &schema->mem};
     rnode *ast = rx_parse_alt(&parser);
-    rcompiler compiler = {&schema->mem, 0, 0};
-    rstate *accept = rx_state(&compiler, RS_ACCEPT);
-    if (parser.failed || ast == NULL || accept == NULL) { /* GCOVR_EXCL_BR_LINE: arena OOM is unforceable */
-        return -1;                                        /* GCOVR_EXCL_LINE */
+    rcompiler compiler = {.mem = &schema->mem};
+    rstate *start = parser.failed ? NULL : rx_compile(&compiler, ast, rx_state(&compiler, RS_ACCEPT));
+    const int failed = parser.failed ? parser.failed : compiler.failed;
+    if (failed == RX_FAIL_MEMORY) { /* GCOVR_EXCL_BR_LINE: arena OOM */
+        PyErr_NoMemory();           /* GCOVR_EXCL_LINE */
+        return -1;                  /* GCOVR_EXCL_LINE */
     }
-    rstate *start = rx_compile(&compiler, ast, accept);
-    if (start == NULL || compiler.failed) { /* GCOVR_EXCL_BR_LINE: arena OOM is unforceable */
-        return -1;                          /* GCOVR_EXCL_LINE */
+    if (failed == RX_FAIL_NESTING) {
+        PyErr_Format(PyExc_ValueError,
+                     "schema pattern nests groups deeper than %d levels at offset %zd; flatten the nested groups",
+                     RX_MAX_GROUP_DEPTH, parser.fail_pos);
+        return -1;
+    }
+    if (failed == RX_FAIL_BOUND) {
+        PyObject *bound =
+            PyUnicode_FromKindAndData(PyUnicode_4BYTE_KIND, text + parser.fail_pos, parser.fail_end - parser.fail_pos);
+        if (bound != NULL) { /* GCOVR_EXCL_BR_LINE: allocation failure */
+            PyErr_Format(PyExc_ValueError,
+                         "schema pattern quantifier %U at offset %zd has its minimum above its maximum", bound,
+                         parser.fail_pos);
+            Py_DECREF(bound);
+        }
+        return -1;
+    }
+    if (failed == RX_FAIL_STATES) {
+        PyErr_Format(PyExc_ValueError,
+                     "schema pattern needs more than %d NFA states; lower its repeat counts or split it into "
+                     "several patterns",
+                     RX_MAX_STATES);
+        return -1;
     }
     pattern->text = text;
     pattern->len = len;
     pattern->start = start;
     pattern->count = compiler.count;
+    if (compiler.count > schema->regex_max_states) {
+        schema->regex_max_states = compiler.count;
+    }
     pattern->next = schema->regex_patterns;
     schema->regex_patterns = pattern;
     return 0;
@@ -536,8 +598,8 @@ static int regex_cache_schema(th_schema *schema, th_node *node) {
     if (schema->kind == 0 && is_schema_el(schema, node, XSD_NS, "pattern")) {
         const th_node_attr *value = attr_exact(schema->tree, node, "value", 5);
         if (value != NULL) {
-            if (regex_cache_add(schema, value->value, value->value_len) < 0) { /* GCOVR_EXCL_BR_LINE: arena OOM */
-                return -1;                                                     /* GCOVR_EXCL_LINE */
+            if (regex_cache_add(schema, value->value, value->value_len) < 0) {
+                return -1;
             }
         }
     } else if (schema->kind != 0 && is_schema_el(schema, node, RNG_NS, "param")) {
@@ -545,8 +607,8 @@ static int regex_cache_schema(th_schema *schema, th_node *node) {
         if (name != NULL && u_eq_ascii(name->value, name->value_len, "pattern")) {
             Py_ssize_t len = 0;
             const Py_UCS4 *text = element_text_raw(schema->tree, node, &len);
-            if (regex_cache_add(schema, text, len) < 0) { /* GCOVR_EXCL_BR_LINE: arena OOM */
-                return -1;                                /* GCOVR_EXCL_LINE */
+            if (regex_cache_add(schema, text, len) < 0) {
+                return -1;
             }
         }
     }
@@ -570,17 +632,52 @@ typedef struct {
     size_t len;
 } rlist;
 
-static void rx_add(rlist *list, const rstate *state, size_t *visited, size_t gen) {
-    if (visited[state->index] == gen) {
-        return;
+/* Match buffers for one validate() call, sized to the schema's largest pattern: two state lists, the split-walk stack
+   and a per-state mark. The mark holds a generation that only grows, so no match has to clear it. */
+typedef struct rscratch {
+    const rstate **lists, **stack;
+    size_t *visited;
+    size_t gen;
+} rscratch;
+
+static rscratch *rx_scratch(th_schema *schema) {
+    if (schema->regex_scratch == NULL) {
+        const size_t states = schema->regex_max_states;
+        rscratch *scratch = arena_alloc(&schema->mem, sizeof(rscratch));
+        const rstate **lists = arena_alloc(&schema->mem, states * 3 * sizeof(rstate *));
+        size_t *visited = arena_alloc(&schema->mem, states * sizeof(size_t));
+        if (scratch == NULL || lists == NULL || visited == NULL) { /* GCOVR_EXCL_BR_LINE: arena OOM */
+            return NULL;                                           /* GCOVR_EXCL_LINE */
+        }
+        memset(visited, 0, states * sizeof(size_t));
+        *scratch = (rscratch){lists, lists + states * 2, visited, 0};
+        schema->regex_scratch = scratch;
     }
-    visited[state->index] = gen;
-    if (state->kind == RS_SPLIT) {
-        rx_add(list, state->out, visited, gen);
-        rx_add(list, state->out1, visited, gen);
-        return;
+    return schema->regex_scratch;
+}
+
+static void rx_push(rscratch *scratch, size_t *top, const rstate *state) {
+    if (scratch->visited[state->index] != scratch->gen) {
+        scratch->visited[state->index] = scratch->gen;
+        scratch->stack[(*top)++] = state;
     }
-    list->items[list->len++] = state;
+}
+
+/* Add every state reachable from start through split states. The iterative compiler builds long split chains, such as
+   the one for a|a|a..., so walking them by recursion overflows a small thread stack; an explicit stack, as in RE2's
+   NFA, holds at most one entry per state because a state is marked when pushed. */
+static void rx_add(rlist *list, const rstate *start, rscratch *scratch) {
+    size_t top = 0;
+    rx_push(scratch, &top, start);
+    while (top > 0) {
+        const rstate *state = scratch->stack[--top];
+        if (state->kind == RS_SPLIT) {
+            rx_push(scratch, &top, state->out1);
+            rx_push(scratch, &top, state->out);
+        } else {
+            list->items[list->len++] = state;
+        }
+    }
 }
 
 static int regex_full_match(th_schema *schema, const Py_UCS4 *text, Py_ssize_t text_len, const Py_UCS4 *value,
@@ -589,22 +686,21 @@ static int regex_full_match(th_schema *schema, const Py_UCS4 *text, Py_ssize_t t
     while (!u_eq_u(text, text_len, pattern->text, pattern->len)) {
         pattern = pattern->next;
     }
-    const rstate **storage = arena_alloc(&schema->mem, pattern->count * 2 * sizeof(rstate *));
-    size_t *visited = arena_alloc(&schema->mem, pattern->count * sizeof(size_t));
-    if (storage == NULL || visited == NULL) { /* GCOVR_EXCL_BR_LINE: arena OOM is unforceable */
-        return 1;                             /* GCOVR_EXCL_LINE */
+    rscratch *scratch = rx_scratch(schema);
+    if (scratch == NULL) {           /* GCOVR_EXCL_BR_LINE: arena OOM */
+        schema->regex_no_memory = 1; /* GCOVR_EXCL_LINE: validate() raises the MemoryError */
+        return 0;                    /* GCOVR_EXCL_LINE: fail closed, the value does not match */
     }
-    memset(visited, 0, pattern->count * sizeof(size_t));
-    rlist current = {storage, 0};
-    rlist next = {storage + pattern->count, 0};
-    size_t gen = 1;
-    rx_add(&current, pattern->start, visited, gen);
+    rlist current = {scratch->lists, 0};
+    rlist next = {scratch->lists + schema->regex_max_states, 0};
+    scratch->gen++;
+    rx_add(&current, pattern->start, scratch);
     for (Py_ssize_t index = 0; index < len; index++) {
-        gen++;
+        scratch->gen++;
         next.len = 0;
         for (size_t state = 0; state < current.len; state++) {
             if (current.items[state]->kind == RS_MATCH && rx_state_match(current.items[state], value[index])) {
-                rx_add(&next, current.items[state]->out, visited, gen);
+                rx_add(&next, current.items[state]->out, scratch);
             }
         }
         rlist swap = current;

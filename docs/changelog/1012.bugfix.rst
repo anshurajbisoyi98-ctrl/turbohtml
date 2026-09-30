@@ -1,0 +1,2 @@
+Raise ``ValueError`` for a schema pattern nested deeper than 250 groups, needing more than 2,000,000 automaton states,
+or holding a ``{n,m}`` quantifier with ``n`` above ``m``, and match long alternations without exhausting the stack.

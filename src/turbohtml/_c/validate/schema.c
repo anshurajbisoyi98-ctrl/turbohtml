@@ -486,6 +486,9 @@ typedef struct th_schema {
     sqname_entry *sqnames;
     Py_ssize_t sqname_count;
     struct rpattern *regex_patterns;
+    size_t regex_max_states;        /* states in the largest compiled pattern, sizing the match buffers */
+    struct rscratch *regex_scratch; /* match buffers of one validate() call, built on its first pattern check */
+    int regex_no_memory;            /* a pattern check of this validate() call could not get its buffers */
     struct xfacet_entry *facet_entries;
     size_t facet_count, facet_cap;
 } th_schema;
@@ -839,9 +842,10 @@ PyObject *turbohtml_schema_compile(PyObject *module, PyObject *args) {
         schema_free(schema);
         return NULL;
     }
-    if (regex_cache_schema(schema, schema->root) < 0) { /* GCOVR_EXCL_BR_LINE: arena OOM is unforceable */
-        schema_free(schema);                            /* GCOVR_EXCL_LINE */
-        return PyErr_NoMemory();                        /* GCOVR_EXCL_LINE */
+    if (regex_cache_schema(schema, schema->root) < 0) {
+        schema_free(schema);
+        /* a pattern that exceeds the regex limits sets a ValueError; only an unforceable arena OOM leaves none */
+        return PyErr_Occurred() ? NULL : PyErr_NoMemory(); /* GCOVR_EXCL_BR_LINE: the OOM arm is unforceable */
     }
     PyObject *capsule = PyCapsule_New(schema, CAPSULE_NAME, capsule_destructor);
     if (capsule == NULL) {   /* GCOVR_EXCL_BR_LINE: capsule creation failure is unforceable */
@@ -877,6 +881,7 @@ TH_NODE_API(, PyObject *, turbohtml_schema_validate, (PyObject * module, PyObjec
     /* Validation buffers and lazy RELAX NG definitions must not outlive this call or mutate a shared schema. */
     th_schema local = *schema;
     local.mem = (arena){0};
+    local.regex_scratch = NULL;
     if (local.defines.len > 0) {
         const size_t bytes = (size_t)local.defines.len * sizeof(def_entry);
         local.defines.items = arena_alloc(&local.mem, bytes);
@@ -901,6 +906,10 @@ TH_NODE_API(, PyObject *, turbohtml_schema_validate, (PyObject * module, PyObjec
     Py_END_CRITICAL_SECTION();
     PyMem_Free(ctx.path.data);
     arena_free(&local.mem);
+    if (local.regex_no_memory) { /* GCOVR_EXCL_BR_LINE: arena OOM */
+        ctx.failed = 1;          /* GCOVR_EXCL_LINE */
+        PyErr_NoMemory();        /* GCOVR_EXCL_LINE */
+    } /* GCOVR_EXCL_LINE: arena OOM */
     if (ctx.failed) {
         Py_DECREF(errors);
         return NULL;

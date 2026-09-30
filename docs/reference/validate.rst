@@ -13,6 +13,12 @@ Schema compilation and instance validation raise :class:`RecursionError` before 
 deeper. This limit keeps the remaining recursive grammar walks within small worker-thread stacks; the validator does not
 return partial results.
 
+Schema compilation raises :class:`ValueError` for an ``xs:pattern`` facet or RELAX NG ``pattern`` parameter that nests
+groups deeper than 250 levels, needs more than 2,000,000 automaton states, or has a ``{n,m}`` quantifier with ``n``
+above ``m``. The message names the limit and the offset where the pattern reaches it; flatten the nested groups, lower
+the repeat counts, or split the pattern into several ``pattern`` facets to stay within the limits. Matching a value
+takes time linear in its length.
+
 .. autoclass:: XMLSchema
     :members:
     :inherited-members:

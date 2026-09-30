@@ -122,6 +122,17 @@ def test_data_param_facets() -> None:
     assert not check(schema, "<s>AB</s>").valid  # pattern
 
 
+def test_data_param_pattern_too_complex_raises() -> None:
+    pattern = "(" * 50000 + "a" + ")" * 50000
+    schema = grammar(
+        f'<start><element name="s"><data type="string"><param name="pattern">{pattern}</param></data>'
+        "</element></start>",
+        attrs=f'datatypeLibrary="{DT}"',
+    )
+    with pytest.raises(ValueError, match="nests groups deeper than 250 levels at offset 250"):
+        RelaxNG(schema)
+
+
 def test_list_pattern() -> None:
     schema = grammar(
         '<start><element name="nums"><list><oneOrMore><data type="int"/></oneOrMore></list></element></start>',
