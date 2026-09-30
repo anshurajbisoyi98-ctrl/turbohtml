@@ -7,6 +7,40 @@
 .. towncrier release notes start
 
 **********************
+ v1.13.0 (2026-09-30)
+**********************
+
+Features - 1.13.0
+=================
+
+- Add :func:`turbohtml.transform.strparam` to pass text as an XSLT parameter without hand-quoting it. (:issue:`928`)
+
+Bug fixes - 1.13.0
+==================
+
+- Reject disallowed URL schemes hidden behind character references in the bleach shim. (:issue:`919`)
+- Check ``<meta http-equiv="refresh">`` redirect URLs against ``url_schemes``. (:issue:`920`)
+- Serialize a CDATA section or processing instruction holding ``>`` as HTML without turning its text into markup.
+  (:issue:`921`)
+- Refuse an ``xsl:import`` of a FIFO, device or directory with ``ValueError`` instead of hanging or exhausting memory.
+  (:issue:`922`)
+- Stop the JavaScript minifier from turning a string it folded or moved into a ``"use strict"`` directive.
+  (:issue:`923`)
+- Stop the CSS minifier from gluing two tokens into one when it drops a comment or space between them. (:issue:`924`)
+- Write text into ``script``, ``style`` and other raw-text elements unescaped in :func:`~turbohtml.rewrite.rewrite`.
+  (:issue:`925`)
+- Accept ``>`` and ``]`` inside the quoted parts of an XML ``<!DOCTYPE>`` in :func:`~turbohtml.parse_xml`.
+  (:issue:`926`)
+- Keep headings and links in wrapped list items parseable as Markdown. (:issue:`929`)
+- Preserve list markers in Markdown table cells and word boundaries in code with block descendants. (:issue:`930`)
+
+Improved documentation - 1.13.0
+===============================
+
+- Warn that builder text inside raw-text elements is written unescaped and that feed fields come back unsanitized.
+  (:issue:`927`)
+
+**********************
  v1.12.0 (2026-09-29)
 **********************
 
