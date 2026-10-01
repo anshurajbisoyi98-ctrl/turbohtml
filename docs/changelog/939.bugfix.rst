@@ -1,2 +1,0 @@
-Keep ``<`` and ``/`` apart when minifying CSS, and return a stylesheet unchanged when its minified form would spell a
-``</style`` its source did not (GHSA-wh2c-9vrv-w597).

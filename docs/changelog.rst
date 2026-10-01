@@ -7,6 +7,50 @@
 .. towncrier release notes start
 
 **********************
+ v1.13.1 (2026-10-01)
+**********************
+
+Bug fixes - 1.13.1
+==================
+
+- Raise ``MemoryError`` for an EXSLT ``str:padding`` length above ``sys.maxsize // 4`` characters instead of writing
+  past a small buffer. (:issue:`933`)
+- Split sanitized CSS declarations where a browser does, reading a backslash outside strings as an escape and an
+  unquoted ``url(...)`` as one token, and drop a declaration whose string a newline ends (GHSA-9x48-74fj-x342).
+  (:issue:`934`)
+- Raise ``ValueError`` on a circular ``xsl:attribute-set`` and ``RecursionError`` past 400 levels of
+  ``use-attribute-sets`` and template nesting instead of crashing, and apply a shared attribute set once per element.
+  (:issue:`935`)
+- Keep XSLT comment and processing-instruction text inside its node, and raise ``ValueError`` when the html method would
+  write ``>`` inside a processing instruction. (:issue:`936`)
+- Leave out an XSLT element, attribute or processing instruction whose computed name is invalid, keeping an element's
+  content, instead of writing the name as markup. (:issue:`937`)
+- Raise ``ValueError`` in :func:`~turbohtml.rewrite.rewrite` when ``set_attribute`` gets a name, or a comment's
+  ``set_text`` gets text, that would inject markup. (:issue:`938`)
+- Keep ``<`` and ``/`` apart when minifying CSS, and return a stylesheet unchanged when its minified form would spell a
+  ``</style`` its source did not (GHSA-wh2c-9vrv-w597). (:issue:`939`)
+- Cap the CSS minifier at 100 nesting levels, dropping a deeper block and copying a deeper function argument through
+  unchanged, instead of overflowing the C stack. (:issue:`940`)
+- Escape ``"`` as ``&quot;`` in attribute values under ``Formatter.MINIMAL``. (:issue:`941`)
+- Escape ``<`` and ``>`` in attribute values under every formatter and in the start tags
+  :func:`~turbohtml.rewrite.rewrite` writes for edited elements. (:issue:`942`)
+- Stop :func:`~turbohtml.clean.minify_js` from creating a ``</script`` or ``<!--`` the source did not spell, and emit an
+  inline script verbatim when its minified form still holds either sequence. (:issue:`943`)
+- Raise :exc:`RuntimeError` from a :meth:`~turbohtml.Node.serialize_iter` stream after a tree edit such as ``extract``
+  or ``clear``, instead of crashing or streaming a cut document. (:issue:`944`)
+- Space apart the sequences that close DOM-built leaf data: a leading ``>`` or ``->`` in a comment outside canonical
+  XML, ``--`` before ``>`` or ``!>`` in an HTML comment, a ``-`` before another ``-`` or at the end in an XML or
+  canonical comment, and ``?>`` in XML instruction data, and split XML CDATA at ``]]>`` (GHSA-7vrw-9mvp-2x7j).
+  (:issue:`945`)
+- Match unsafe names and the per-name policy options in any ASCII case when sanitizing :func:`~turbohtml.parse_xml`
+  trees, and replace an attribute spelled in another case when writing one (GHSA-pjrh-5m66-3wwf). (:issue:`946`)
+- Stop ``re:test``, ``re:replace``, ``matches`` and ``replace`` from hanging on patterns such as ``(a+)+$``; oversized
+  patterns and runaway back-references raise ``ValueError``. (:issue:`947`)
+- Raise ``ValueError`` for a schema pattern nested deeper than 250 groups, needing more than 2,000,000 automaton states,
+  or holding a ``{n,m}`` quantifier with ``n`` above ``m``, and match long alternations without exhausting the stack.
+  (:issue:`948`)
+
+**********************
  v1.13.0 (2026-09-30)
 **********************
 

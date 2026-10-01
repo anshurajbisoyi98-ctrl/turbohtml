@@ -1,1 +1,0 @@
-Escape ``"`` as ``&quot;`` in attribute values under ``Formatter.MINIMAL``.
