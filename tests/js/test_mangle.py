@@ -15,7 +15,7 @@ import subprocess  # ruff:ignore[suspicious-subprocess-import]
 
 import pytest
 
-from turbohtml.clean import minify_js
+from turbohtml.clean import JSMinify, minify_js
 
 _NODE = shutil.which("node")
 
@@ -194,6 +194,32 @@ def test_mangling_preserves_behavior(snippet: str) -> None:
         pytest.param(
             "function t(){class C{}return[C,C]}", "function t(){class a{}return[a,a]}", id="body-level-class-renamed"
         ),
+        pytest.param(
+            "function t(){var g=1;try{throw 0}catch(e){function g(){}}return typeof g}",
+            "function t(){var g=1;try{throw 0}catch(a){function g(){}}return typeof g}",
+            id="catch-block-outer-var-kept",
+        ),
+        pytest.param(
+            "function t(){var g=1;try{throw 0}catch{function g(){}}return typeof g}",
+            "function t(){var g=1;try{throw 0}catch{function g(){}}return typeof g}",
+            id="catch-block-without-binding",
+        ),
+        pytest.param(
+            "function t(){var g=1;if(1)function g(){}return typeof g}",
+            "function t(){var g=1;if(1)function g(){}return typeof g}",
+            id="if-clause-outer-var-kept",
+        ),
+        pytest.param(
+            "function t(){var g=1;if(0);else function g(){}return typeof g}",
+            "function t(){var g=1;if(0);else function g(){}return typeof g}",
+            id="else-clause-outer-var-kept",
+        ),
+        # a catch block scopes its own let like any block, so the binding renames instead of resolving outward
+        pytest.param(
+            "function t(){try{throw 0}catch(e){let q=h();return[q,q]}}",
+            "function t(){try{throw 0}catch(b){let a=h();return[a,a]}}",
+            id="catch-block-let-renamed",
+        ),
     ],
 )
 def test_annex_b_block_function(source: str, expected: str) -> None:
@@ -215,6 +241,23 @@ def test_annex_b_block_function(source: str, expected: str) -> None:
         pytest.param(
             "function o(){var g=5;function t(){{function g(){}}return g}return typeof t()}console.log(o())",
             id="outer-function-binding",
+        ),
+        pytest.param(
+            "function f(){var g=1;try{throw 0}catch(e){function g(){}}return typeof g}console.log(f())",
+            id="catch-block-outer-var",
+        ),
+        pytest.param(
+            "function f(){var g=1;try{throw 0}catch(e){function g(){return 2}}return g()}console.log(f())",
+            id="catch-block-outer-var-called",
+        ),
+        pytest.param(
+            "function o(){var g=5;function t(){try{throw 0}catch(e){function g(){}}return g}return typeof t()}"
+            "console.log(o())",
+            id="catch-block-outer-function-binding",
+        ),
+        pytest.param("function f(){var g=1;if(1)function g(){}return typeof g}console.log(f())", id="if-clause"),
+        pytest.param(
+            "function f(){var g=1;if(0);else function g(){}return typeof g}console.log(f())", id="else-clause"
         ),
     ],
 )
@@ -280,6 +323,86 @@ def test_function_declaration_shares_binding(source: str, expected: str) -> None
 )
 def test_function_declaration_shares_binding_preserves_behavior(snippet: str) -> None:
     assert _run(snippet) == _run(minify_js(snippet))
+
+
+@pytest.mark.parametrize(
+    ("source", "expected"),
+    [
+        pytest.param("var a;function f(x){a++}", "var a;function f(b){a++}", id="top-level-var-written-inside"),
+        pytest.param(
+            "var a=1;function f(x,y){return a+x+y}", "var a=1;function f(c,b){return a+c+b}", id="top-level-var-read"
+        ),
+        pytest.param(
+            "var a=1;function f(x){return function(y){return a+x+y}}",
+            "var a=1;function f(b){return function(c){return a+b+c}}",
+            id="read-two-scopes-down",
+        ),
+        pytest.param("let a=1;{let x=g();h(a,x,x)}", "let a=1;{let b=g();h(a,b,b)}", id="top-level-block"),
+        pytest.param("const a=1;function f(x){return[a,x]}", "const a=1;function f(b){return[a,b]}", id="const"),
+        pytest.param("var a=1;var f=x=>a+x", "var a=1,f=b=>a+b", id="arrow-param"),
+        # a label is its own namespace, so its name stays free for a binding
+        pytest.param(
+            "function f(x){a:for(;;)break a;return x}", "function f(a){a:for(;;)break a;return a}", id="label"
+        ),
+        pytest.param(
+            "function f(x){try{throw 1}catch(a){var a=2;return x}}",
+            "function f(b){try{throw 1}catch(a){var a=2;return b}}",
+            id="pinned-catch-parameter",
+        ),
+        # a var in a catch body that names something else is an ordinary local
+        pytest.param(
+            "function f(){try{throw 1}catch(e){var longName=g();return[longName,e,longName]}}",
+            "function f(){try{throw 1}catch(b){var a=g();return[a,b,a]}}",
+            id="catch-body-var-renamed",
+        ),
+    ],
+)
+def test_rename_avoids_kept_names(source: str, expected: str) -> None:
+    assert minify_js(source) == expected
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        pytest.param("try{}catch(a){var a}console.log(a)", id="top-level"),
+        pytest.param("function f(){try{throw 1}catch(a){var a=2}return a}", id="initializer"),
+        pytest.param("function f(){try{throw 1}catch(a){var [,a]=[1,2]}return a}", id="array-hole"),
+        pytest.param("function f(){try{throw 1}catch(a){var [a=2]=[]}return a}", id="array-default"),
+        pytest.param("function f(){try{throw 1}catch(a){var [...a]=[]}return a}", id="array-rest"),
+        pytest.param("function f(){try{throw 1}catch(a){var {a}={a:2}}return a}", id="object-shorthand"),
+        pytest.param("function f(){try{throw 1}catch(a){var {k:a}={k:2}}return a}", id="object-key"),
+        pytest.param("function f(){try{throw 1}catch(a){var {...a}={}}return a}", id="object-rest"),
+        pytest.param("function f(){try{throw 1}catch(a){try{throw 2}catch(b){var a=3}}return a}", id="outer-catch"),
+    ],
+)
+def test_catch_parameter_redeclared_by_var_kept(source: str) -> None:
+    assert minify_js(source) == source
+
+
+@pytest.mark.skipif(_NODE is None, reason="node not available")
+@pytest.mark.parametrize(
+    "options", [pytest.param(JSMinify(), id="fold"), pytest.param(JSMinify(fold=False), id="no-fold")]
+)
+@pytest.mark.parametrize(
+    "snippet",
+    [
+        pytest.param("var a;function f(x){a++}f();console.log(a)", id="top-level-var-written-inside"),
+        pytest.param("var a=1;function f(x,y){return a+x+y}console.log(f(2,3))", id="top-level-var-read"),
+        pytest.param("let a=1;{let x=g();console.log(a,x,x)}function g(){return 2}", id="top-level-block"),
+        pytest.param("try{}catch(a){var a}console.log(a)", id="catch-var-top-level"),
+        pytest.param(
+            "function f(){var r=[];try{throw 1}catch(a){var a=2;r.push(a)}r.push(a);return r.join()}console.log(f())",
+            id="catch-var-initializer",
+        ),
+        pytest.param(
+            "function f(p){try{throw 1}catch(a){var a=2}return[a,p].join()}console.log(f(9))", id="catch-var-with-param"
+        ),
+        pytest.param("function f(){try{throw 1}catch(a){var [a]=[2]}return a}console.log(f())", id="catch-var-pattern"),
+        pytest.param("function f(){try{throw 1}catch(e){const q=[e];return q}}console.log(f())", id="catch-const"),
+    ],
+)
+def test_kept_names_preserve_behavior(snippet: str, options: JSMinify) -> None:
+    assert _run(snippet) == _run(minify_js(snippet, options))
 
 
 _BS = chr(0x5C)  # backslash, kept out of the literals so the \u escapes are unambiguous
