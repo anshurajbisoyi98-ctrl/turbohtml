@@ -50,6 +50,9 @@ serialization*. They are different algorithms, not two escaping levels of one, a
 ``XMLSerializer`` a browser exposes all target the same form. turbohtml keeps a single tree walk and branches on a flag
 at the four points the algorithms diverge, so the HTML fast path is untouched.
 
+HTML void elements, including ``frame``, have empty ``inner_html`` even if children were added through the DOM.
+``inner_xml`` keeps those children, as does ``inner_html`` on a foreign element with the same tag name.
+
 The first divergence is empty elements. HTML has a closed list of *void* elements (``br``, ``img``, ``input``, ...) that
 take a start tag and never an end tag, and every other empty element still writes ``<div></div>``. XML has no such list:
 any element with no children self-closes as ``<div/>`` and a childless ``<br>`` becomes ``<br/>`` for the same reason a

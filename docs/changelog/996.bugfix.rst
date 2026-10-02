@@ -1,0 +1,1 @@
+Return empty ``inner_html`` for HTML void elements, including ``frame``, even when children were added through the DOM.
