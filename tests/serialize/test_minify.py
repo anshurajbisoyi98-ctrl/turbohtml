@@ -480,6 +480,24 @@ def test_minify_raw_text_joins_an_empty_text_child(tag: str, source: str, layout
     assert element.serialize(Html(layout=layout)) == f"<{tag}>{expected}</{tag}>"
 
 
+@pytest.mark.parametrize("tag", ["script", "style"])
+@pytest.mark.parametrize("comment", ["", "note"])
+@pytest.mark.parametrize("strip_comments", [False, True])
+def test_minify_raw_text_comment_child_options(tag: str, comment: str, *, strip_comments: bool) -> None:
+    source: Final = "var a = 1;" if tag == "script" else "a { color: red }"
+    document: Final = parse(f"<!--{comment}--><{tag}>{source}</{tag}>")
+    element = document.find(tag)
+    assert isinstance(element, Element)
+    element.insert(0, document.children[0])
+    layout: Final = Minify(strip_comments=strip_comments, minify_js=JSMinify(), minify_css=CSSMinify())
+    expected = source
+    if strip_comments and not comment:
+        expected = "var a=1" if tag == "script" else "a{color:red}"
+    if not strip_comments:
+        expected = f"<!--{comment}-->{expected}"
+    assert element.serialize(Html(layout=layout)) == f"<{tag}>{expected}</{tag}>"
+
+
 def test_omit_dd_end_kept_before_text() -> None:
     assert frag("<dl><dd>a</dd>x</dl>", strip_comments=False) == "<dl><dd>a</dd>x</dl>"
 

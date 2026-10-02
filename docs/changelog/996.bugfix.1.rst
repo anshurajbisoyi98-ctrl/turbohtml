@@ -1,0 +1,1 @@
+Stripped empty comments no longer prevent JavaScript or CSS minification in constructed raw-text elements.
