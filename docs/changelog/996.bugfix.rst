@@ -1,1 +1,1 @@
-Return empty ``inner_html`` for HTML void elements, including ``frame``, even when children were added through the DOM.
+``inner_html`` of a ``frame`` with children added through the DOM now returns an empty string.

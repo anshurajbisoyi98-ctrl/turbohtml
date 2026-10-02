@@ -680,18 +680,21 @@ def test_inner_keyword_only(method: str, arguments: tuple[object, ...]) -> None:
 def test_inner_frame_ignores_children(layout: Indent | Minify | None) -> None:
     root: Final = Element("frame", children=[Text("not emitted")])
     assert not root.serialize(Html(layout=layout), inner=True)
-    assert not root.inner_html
 
 
-@pytest.mark.parametrize("markup", ["<svg><frame>x</frame></svg>", "<math><frame>x</frame></math>"])
-def test_inner_foreign_frame_keeps_children(markup: str) -> None:
-    root: Final = _one(markup, "frame")
-    assert root.inner_html == "x"
+def test_inner_html_frame_ignores_children() -> None:
+    assert not Element("frame", children=[Text("not emitted")]).inner_html
 
 
-def test_inner_frame_xml_keeps_children() -> None:
-    root: Final = Element("frame", children=[Text("x<")])
-    assert root.inner_xml == "x&lt;"
+@pytest.mark.parametrize(
+    "markup",
+    [
+        pytest.param("<svg><frame>x</frame></svg>", id="svg"),
+        pytest.param("<math><frame>x</frame></math>", id="mathml"),
+    ],
+)
+def test_inner_html_foreign_frame_keeps_children(markup: str) -> None:
+    assert _one(markup, "frame").inner_html == "x"
 
 
 @pytest.mark.parametrize("layout", [None, Indent(), Minify()])

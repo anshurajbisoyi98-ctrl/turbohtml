@@ -727,7 +727,7 @@ static void serialize_minify(sbuf *out, th_tree *tree, th_node *root, const th_m
             }
             if (is_rawtext_element(node, tree->scripting)) {
                 /* the JS and CSS minifiers parse text alone, so a markup child keeps the content verbatim */
-                if (rawtext_markup_child(node, opts->strip_comments) != NULL) {
+                if (rawtext_markup_child(node) != NULL) {
                     ser_put_rawtext_markup(out, tree, node, node->first_child, st, opts->strip_comments);
                 } else if (!(opts->minify_js && mini_emit_script_js(out, tree, node, opts)) &&
                            !(opts->minify_css && mini_emit_style_css(out, tree, node, opts->minify_css_baseline))) {

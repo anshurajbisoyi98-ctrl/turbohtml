@@ -433,11 +433,11 @@ static inline int is_rawtext_element(const th_node *node, int scripting) {
     return (node->tag_flags & TH_TAG_RAWTEXT) && (node->atom != TH_TAG_NOSCRIPT || scripting);
 }
 
-/* A raw-text element's first markup child, or NULL. A stripped empty comment adds no text to a JS/CSS minifier. */
-static inline th_node *rawtext_markup_child(const th_node *node, int strip_empty_comments) {
+/* A raw-text element's first child that is not text, or NULL: a parse gives such an element only text children, so
+   anything else came from the DOM API. */
+static inline th_node *rawtext_markup_child(const th_node *node) {
     th_node *child = node->first_child;
-    while (child != NULL && (child->type == TH_NODE_TEXT || child->type == TH_NODE_CDATA ||
-                             (strip_empty_comments && child->type == TH_NODE_COMMENT && child->text_len == 0))) {
+    while (child != NULL && (child->type == TH_NODE_TEXT || child->type == TH_NODE_CDATA)) {
         child = child->next_sibling;
     }
     return child;

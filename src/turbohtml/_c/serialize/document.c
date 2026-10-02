@@ -368,7 +368,7 @@ SER_NOINLINE void ser_put_rawtext_markup(sbuf *out, th_tree *tree, th_node *elem
         } else if (node->type == TH_NODE_COMMENT && strip_comments) {
             node = ser_markup_next(out, node, element);
         } else if (node->type == TH_NODE_ELEMENT && is_rawtext_element(node, tree->scripting) &&
-                   rawtext_markup_child(node, 0) != NULL) {
+                   rawtext_markup_child(node) != NULL) {
             ser_open_tag(out, tree, node, &content);
             sbuf_putc(out, '>');
             node = node->first_child;
